@@ -598,6 +598,73 @@ static int ioctl(omv_csi_t *csi, int request, va_list ap) {
             fb_free();
             break;
         }
+        case OMV_CSI_IOCTL_GENX320_DEBUG_CAPTURE: {
+            // Experimental: capture raw EVT2.0 bytes from the sensor with the
+            // CSI peripheral's IMAG_PARA image-height shrunk to `height_lines`.
+            // Used by the evtstream task-3 pre-implementation validation to
+            // verify that small DMA frames still yield coherent EVT2.0 streams.
+            // Args: (uint8_t *out_buf, uint32_t out_size, int height_lines).
+            // Returns the number of bytes copied into out_buf, or a negative
+            // OMV_CSI_ERROR_* code.
+            uint8_t *out_buf = (uint8_t *) va_arg(ap, void *);
+            uint32_t out_size = va_arg(ap, uint32_t);
+            int height_lines = va_arg(ap, int);
+
+            #if defined(OMV_CSI_HAS_IMAG_PARA_OVERRIDE) && (OMV_CSI_HAS_IMAG_PARA_OVERRIDE == 1)
+            extern uint16_t omv_csi_imag_para_height_override;
+
+            if (genx->mode != OMV_CSI_GENX320_MODE_EVENT) {
+                ret = OMV_CSI_ERROR_CTL_FAILED;
+                break;
+            }
+            if (omv_csi_get_cropped(csi) || csi->transpose) {
+                ret = OMV_CSI_ERROR_CAPTURE_FAILED;
+                break;
+            }
+            int default_height = csi->resolution[csi->framesize][1];
+            if (height_lines < 1 || height_lines > default_height) {
+                ret = OMV_CSI_ERROR_INVALID_ARGUMENT;
+                break;
+            }
+
+            // Apply the override around the snapshot so the next imx_csi_snapshot
+            // programs IMAG_PARA height to `height_lines` instead of the default.
+            // The CSI is reset between snapshots only when not currently active,
+            // so we pre-abort to ensure the new IMAG_PARA actually takes effect.
+            omv_csi_abort(csi, true, false);
+            uint16_t saved_override = omv_csi_imag_para_height_override;
+            omv_csi_imag_para_height_override = (uint16_t) height_lines;
+
+            image_t image;
+            ret = omv_csi_snapshot(csi, &image, OMV_CSI_FLAG_NO_POST);
+
+            omv_csi_imag_para_height_override = saved_override;
+
+            if (ret < 0) {
+                break;
+            }
+
+            // Copy raw bytes from the framebuffer to the user buffer. Only
+            // height_lines * dma_line_bytes are guaranteed-valid; the rest of
+            // the framebuffer is stale.
+            uint32_t dma_line_bytes = (uint32_t) csi->resolution[csi->framesize][0];
+            uint32_t bytes_available = (uint32_t) height_lines * dma_line_bytes;
+            uint32_t bytes_to_copy = (bytes_available < out_size) ? bytes_available : out_size;
+            memcpy(out_buf, image.data, bytes_to_copy);
+
+            // Force-invalidate the framebuffer so the next normal snapshot
+            // doesn't see this small-frame DMA result.
+            csi->fb->pixfmt = PIXFORMAT_INVALID;
+
+            ret = (int) bytes_to_copy;
+            #else
+            (void) out_buf;
+            (void) out_size;
+            (void) height_lines;
+            ret = OMV_CSI_ERROR_CTL_UNSUPPORTED;
+            #endif
+            break;
+        }
         default: {
             ret = -1;
             break;

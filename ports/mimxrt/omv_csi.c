@@ -50,6 +50,12 @@
 
 extern uint8_t _line_buf[OMV_LINE_BUF_SIZE];
 
+// Experimental: when non-zero, overrides the IMAG_PARA image-height field
+// in imx_csi_snapshot() so we can validate small-height DMA framing for
+// the evtstream task-3 design. 0 = use the default (csi->one_shot ? fb->v : 1).
+// Set/cleared from the GENX320_DEBUG_CAPTURE IOCTL handler.
+uint16_t omv_csi_imag_para_height_override = 0;
+
 #define CSI_IRQ_FLAGS    (CSI_CR1_SOF_INTEN_MASK            \
                           | CSI_CR1_FB2_DMA_DONE_INTEN_MASK \
                           | CSI_CR1_FB1_DMA_DONE_INTEN_MASK)
@@ -384,9 +390,13 @@ int imx_csi_snapshot(omv_csi_t *csi, image_t *image, uint32_t flags) {
         // Configure DMA buffers.
         CSI_REG_DMASA_FB1(CSI) = (uint32_t) (&_line_buf[OMV_LINE_BUF_SIZE * 0]);
         CSI_REG_DMASA_FB2(CSI) = (uint32_t) (&_line_buf[OMV_LINE_BUF_SIZE / 2]);
+        uint16_t imag_para_height = csi->one_shot ? fb->v : 1;
+        if (omv_csi_imag_para_height_override != 0) {
+            imag_para_height = omv_csi_imag_para_height_override;
+        }
         CSI_REG_IMAG_PARA(CSI) =
             (dma_line_bytes << CSI_IMAG_PARA_IMAGE_WIDTH_SHIFT) |
-            ((csi->one_shot ? fb->v : 1) << CSI_IMAG_PARA_IMAGE_HEIGHT_SHIFT);
+            (imag_para_height << CSI_IMAG_PARA_IMAGE_HEIGHT_SHIFT);
 
         // Enable CSI interrupts.
         CSI_EnableInterrupts(CSI, CSI_IRQ_FLAGS);

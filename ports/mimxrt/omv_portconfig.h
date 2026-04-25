@@ -36,6 +36,11 @@
 #define IOMUXC_PAD_CTL(opt, val)    (IOMUXC_SW_PAD_CTL_PAD_##opt(val))
 #define IOMUXC_MUX_CTL(opt, val)    (IOMUXC_SW_MUX_CTL_PAD_##opt(val))
 
+// Experimental: this port honors the IMAG_PARA image-height override
+// variable used by the GENX320_DEBUG_CAPTURE IOCTL (evtstream task-3
+// validation). Other ports leave this undefined and return CTL_UNSUPPORTED.
+#define OMV_CSI_HAS_IMAG_PARA_OVERRIDE  (1)
+
 // *INDENT-OFF*
 // omv_gpio_t definitions
 

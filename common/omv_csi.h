@@ -239,6 +239,12 @@ typedef enum {
     OMV_CSI_IOCTL_GENX320_READ_EVENTS   = 0x24,
     OMV_CSI_IOCTL_GENX320_CALIBRATE     = 0x25,
     OMV_CSI_IOCTL_GENX320_SET_STC       = 0x26,
+    // Experimental: validates that shrinking the i.MX CSI peripheral's
+    // IMAG_PARA image-height to a small value (e.g. 13 lines) still yields
+    // coherent EVT2.0 streams from the GenX320 in event mode. Used by the
+    // evtstream task-3 pre-implementation validation. Args: (uint8_t *buf,
+    // uint32_t buf_size, int height_lines). Returns bytes captured.
+    OMV_CSI_IOCTL_GENX320_DEBUG_CAPTURE = 0x27,
     OMV_CSI_IOCTL_UPDATE_AGC_AEC        = 0x7F
 } omv_csi_ioctl_t;
 
