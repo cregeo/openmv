@@ -1285,6 +1285,33 @@ static mp_obj_t py_csi_ioctl(size_t n_args, const mp_obj_t *args) {
             }
             break;
         }
+        case OMV_CSI_IOCTL_GENX320_DEBUG_CAPTURE_CONTINUOUS: {
+            // Experimental: args = (uint16 ndarray (N,8) for per-FB stats,
+            // int height_lines, int duration_ms). Returns the number of
+            // FB-completion stats rows written.
+            if (n_args == 3 && MP_OBJ_IS_TYPE(args[0], &ulab_ndarray_type)) {
+                ndarray_obj_t *array = MP_OBJ_TO_PTR(args[0]);
+                if (array->dtype != NDARRAY_UINT16) {
+                    mp_raise_msg(&mp_type_ValueError,
+                                 MP_ERROR_TEXT("Expected a uint16 ndarray"));
+                }
+                if (!ndarray_is_dense(array) || array->ndim != 2 ||
+                    array->shape[ULAB_MAX_DIMS - 1] != 8) {
+                    mp_raise_msg(&mp_type_ValueError,
+                                 MP_ERROR_TEXT("Expected a dense (N, 8) uint16 ndarray"));
+                }
+                uint32_t capacity_rows =
+                    (uint32_t) array->shape[ULAB_MAX_DIMS - 2];
+                int height_lines = mp_obj_get_int(args[1]);
+                int duration_ms = mp_obj_get_int(args[2]);
+                error = omv_csi_ioctl(self->csi, request, array->array,
+                                      capacity_rows, height_lines, duration_ms);
+                if (error > 0) {
+                    ret_obj = mp_obj_new_int(error);
+                }
+            }
+            break;
+        }
         #endif // (OMV_GENX320_ENABLE == 1)
 
         default: {
@@ -1627,6 +1654,7 @@ static const mp_rom_map_elem_t globals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_IOCTL_GENX320_READ_EVENTS),    MP_ROM_INT(OMV_CSI_IOCTL_GENX320_READ_EVENTS)},
     { MP_ROM_QSTR(MP_QSTR_IOCTL_GENX320_CALIBRATE),      MP_ROM_INT(OMV_CSI_IOCTL_GENX320_CALIBRATE)},
     { MP_ROM_QSTR(MP_QSTR_IOCTL_GENX320_DEBUG_CAPTURE),  MP_ROM_INT(OMV_CSI_IOCTL_GENX320_DEBUG_CAPTURE)},
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_GENX320_DEBUG_CAPTURE_CONTINUOUS), MP_ROM_INT(OMV_CSI_IOCTL_GENX320_DEBUG_CAPTURE_CONTINUOUS)},
     { MP_ROM_QSTR(MP_QSTR_PIX_OFF_EVENT),                MP_ROM_INT(EC_PIX_OFF_EVENT)},
     { MP_ROM_QSTR(MP_QSTR_PIX_ON_EVENT),                 MP_ROM_INT(EC_PIX_ON_EVENT)},
     { MP_ROM_QSTR(MP_QSTR_RST_TRIGGER_RISING),           MP_ROM_INT(EC_RST_TRIGGER_RISING)},

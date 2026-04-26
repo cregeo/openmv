@@ -245,6 +245,15 @@ typedef enum {
     // evtstream task-3 pre-implementation validation. Args: (uint8_t *buf,
     // uint32_t buf_size, int height_lines). Returns bytes captured.
     OMV_CSI_IOCTL_GENX320_DEBUG_CAPTURE = 0x27,
+    // Experimental: continuous-DMA sibling to DEBUG_CAPTURE. Configures the
+    // CSI peripheral with a small IMAG_PARA height in non-one_shot ping-pong
+    // mode and runs for `duration_ms` of wall-clock time, accumulating
+    // per-FB-completion stats into the caller's ndarray. Used by the
+    // evtstream task-3 RISK1 follow-up validation to discriminate the
+    // "small buffer truncates burst" hypothesis from the "snapshot lifecycle
+    // gap" hypothesis. Args: (uint16_t *stats_buf, uint32_t stats_capacity_rows,
+    // int height_lines, int duration_ms). Returns rows written.
+    OMV_CSI_IOCTL_GENX320_DEBUG_CAPTURE_CONTINUOUS = 0x28,
     OMV_CSI_IOCTL_UPDATE_AGC_AEC        = 0x7F
 } omv_csi_ioctl_t;
 

@@ -56,6 +56,18 @@ extern uint8_t _line_buf[OMV_LINE_BUF_SIZE];
 // Set/cleared from the GENX320_DEBUG_CAPTURE IOCTL handler.
 uint16_t omv_csi_imag_para_height_override = 0;
 
+// Experimental: continuous ping-pong DMA mode for the
+// GENX320_DEBUG_CAPTURE_CONTINUOUS IOCTL. When omv_csi_streaming_active is
+// true, the CSI IRQ short-circuits the existing SOF / line / frame callback
+// chain and instead calls omv_csi_streaming_cb(fb_addr, arg) once per
+// FB-done interrupt. Caller (see imx_csi_streaming_start / _stop) is
+// responsible for (a) keeping the FB1/FB2 buffers alive, (b) keeping the
+// callback IRQ-safe, (c) calling _stop within a bounded time so we don't
+// strand the CSI in continuous mode.
+volatile bool omv_csi_streaming_active = false;
+void (*omv_csi_streaming_cb)(uint8_t *fb_addr, void *arg) = NULL;
+void *omv_csi_streaming_arg = NULL;
+
 #define CSI_IRQ_FLAGS    (CSI_CR1_SOF_INTEN_MASK            \
                           | CSI_CR1_FB2_DMA_DONE_INTEN_MASK \
                           | CSI_CR1_FB1_DMA_DONE_INTEN_MASK)
@@ -128,6 +140,13 @@ static int imx_clk_set_frequency(omv_clk_t *clk, uint32_t frequency) {
 }
 
 void omv_csi_sof_callback(omv_csi_t *csi) {
+    // Streaming mode short-circuit: FB1/FB2 are pre-set to caller buffers,
+    // we just (re)kick the DMA. No framebuffer ring interaction.
+    if (omv_csi_streaming_active) {
+        CSI_REG_CR3(CSI) |= (CSI_CR3_DMA_REFLASH_RFF_MASK | CSI_CR3_DMA_REQ_EN_RFF_MASK);
+        return;
+    }
+
     csi->first_line = false;
     csi->drop_frame = false;
 
@@ -206,6 +225,16 @@ void omv_csi_frame_callback(omv_csi_t *csi) {
 }
 
 void omv_csi_line_callback(omv_csi_t *csi, uint32_t addr) {
+    // Streaming mode short-circuit: hand the just-completed FB to the
+    // registered callback and return. No framebuffer ring interaction;
+    // no EDMA line copy. Runs in CSI IRQ context — keep callback bounded.
+    if (omv_csi_streaming_active) {
+        if (omv_csi_streaming_cb != NULL) {
+            omv_csi_streaming_cb((uint8_t *) addr, omv_csi_streaming_arg);
+        }
+        return;
+    }
+
     framebuffer_t *fb = csi->fb;
 
     // omv_csi_line_callback() will be called at the end of the complete frame in one-shot mode.
@@ -495,5 +524,83 @@ int omv_csi_ops_init(omv_csi_t *csi) {
     csi->clk->set_freq = imx_clk_set_frequency;
     csi->clk->get_freq = imx_clk_get_frequency;
     return 0;
+}
+
+// Experimental: continuous ping-pong DMA mode for the
+// GENX320_DEBUG_CAPTURE_CONTINUOUS validation IOCTL.
+//
+// Configures the i.MX CSI peripheral with `IMAG_PARA` height = `height_lines`
+// and `dma_line_bytes` width, points FB1 / FB2 at the caller buffers, and
+// installs `cb` as the per-FB-done IRQ handler. CSI runs continuously
+// without ever entering the off-time of the snapshot lifecycle.
+//
+// Caller must:
+//   - hold fb1 / fb2 alive until imx_csi_streaming_stop() returns
+//   - keep `cb` IRQ-safe and bounded in runtime
+//   - have aborted any prior CSI activity before calling
+//   - call imx_csi_streaming_stop() within a bounded window
+int imx_csi_streaming_start(omv_csi_t *csi,
+                            uint8_t *fb1, uint8_t *fb2,
+                            uint16_t dma_line_bytes,
+                            uint16_t height_lines,
+                            void (*cb)(uint8_t *fb_addr, void *arg),
+                            void *arg) {
+    if (omv_csi_streaming_active) {
+        return OMV_CSI_ERROR_CTL_FAILED;
+    }
+    if (cb == NULL || fb1 == NULL || fb2 == NULL ||
+        dma_line_bytes == 0 || height_lines == 0) {
+        return OMV_CSI_ERROR_INVALID_ARGUMENT;
+    }
+    uint32_t total = (uint32_t) dma_line_bytes * (uint32_t) height_lines;
+    if (total % DMA_LENGTH_ALIGNMENT) {
+        return OMV_CSI_ERROR_INVALID_FRAMESIZE;
+    }
+
+    // Reset CSI to a known state. Sub-call to imx_csi_abort first so the
+    // peripheral isn't running when we touch IMAG_PARA / DMASA registers.
+    omv_csi_abort(csi, true, false);
+
+    // Configure DMA addresses and image dimensions.
+    CSI_REG_DMASA_FB1(CSI) = (uint32_t) fb1;
+    CSI_REG_DMASA_FB2(CSI) = (uint32_t) fb2;
+    CSI_REG_IMAG_PARA(CSI) =
+        (((uint32_t) dma_line_bytes) << CSI_IMAG_PARA_IMAGE_WIDTH_SHIFT) |
+        (((uint32_t) height_lines) << CSI_IMAG_PARA_IMAGE_HEIGHT_SHIFT);
+
+    // No EDMA line copy in streaming mode — we read events out of FB1/FB2
+    // directly in the callback. Set dest_inc = 0 as a sentinel.
+    csi->dest_inc = 0;
+    csi->one_shot = false;
+
+    // Install the callback last, so a stray IRQ before this point doesn't
+    // jump through a half-initialized hook.
+    omv_csi_streaming_cb = cb;
+    omv_csi_streaming_arg = arg;
+    __DSB();
+    omv_csi_streaming_active = true;
+
+    // Enable CSI interrupts (SOF + FB1_done + FB2_done) and start CSI.
+    CSI_EnableInterrupts(CSI, CSI_IRQ_FLAGS);
+    NVIC_ClearPendingIRQ(CSI_IRQn);
+    NVIC_SetPriority(CSI_IRQn, IRQ_PRI_CSI);
+    NVIC_EnableIRQ(CSI_IRQn);
+    CSI_REG_CR18(CSI) |= CSI_CR18_CSI_ENABLE_MASK;
+
+    return 0;
+}
+
+void imx_csi_streaming_stop(omv_csi_t *csi) {
+    // Clear active flag first so any in-flight CSI IRQ that fires during
+    // the abort sequence falls through cleanly without calling our cb.
+    omv_csi_streaming_active = false;
+    __DSB();
+
+    // Tear down CSI; reuses the existing abort path so other state stays
+    // consistent (NVIC, DMA enable bit, etc).
+    omv_csi_abort(csi, true, false);
+
+    omv_csi_streaming_cb = NULL;
+    omv_csi_streaming_arg = NULL;
 }
 #endif // MICROPY_PY_CSI

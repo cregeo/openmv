@@ -89,6 +89,94 @@ typedef struct genx_state {
 
 static genx_state_t genx = {};
 
+#if defined(OMV_CSI_HAS_IMAG_PARA_OVERRIDE) && (OMV_CSI_HAS_IMAG_PARA_OVERRIDE == 1)
+// Experimental: buffers and state for the GENX320_DEBUG_CAPTURE_CONTINUOUS
+// IOCTL. These live in DTCM (default for BSS on RT1062, per
+// OMV_MAIN_MEMORY = DTCM in boards/OPENMV_RT1060/omv_boardconfig.h) so the
+// CSI's DMA writes are non-cacheable and the IRQ-context decoder can read
+// them without manual cache invalidation. Sized for up to 8 lines × 1024
+// bytes per FB; we expose `height_lines` to Python but cap at 8.
+#define DEBUG_STREAM_MAX_FB_BYTES   (8 * 1024)
+#define DEBUG_STREAM_MAX_HEIGHT     (8)
+#define DEBUG_STREAM_STATS_COLS     (8)
+
+static uint8_t debug_stream_fb1[DEBUG_STREAM_MAX_FB_BYTES]
+    __attribute__((aligned(64)));
+static uint8_t debug_stream_fb2[DEBUG_STREAM_MAX_FB_BYTES]
+    __attribute__((aligned(64)));
+
+static struct {
+    uint16_t (*stats)[DEBUG_STREAM_STATS_COLS];
+    uint32_t capacity;
+    volatile uint32_t n_fbs;
+    uint32_t fb_size_bytes;
+    uint64_t event_time_us;     // running EV_TIME_HIGH accumulator
+} debug_stream_state;
+
+static void debug_stream_decode_cb(uint8_t *fb_addr, void *arg) {
+    (void) arg;
+    // Bounded runtime: walk fb_size_bytes/4 EVT2.0 words, count categories,
+    // append a per-FB stats row. ts_us is captured AFTER decoding so the
+    // recorded time reflects FB-completion plus our IRQ latency — close
+    // enough for Hypothesis A/B discrimination, no extra synchronization
+    // overhead. CSI is already filling the OTHER FB while we decode.
+    if (debug_stream_state.n_fbs >= debug_stream_state.capacity) {
+        return;
+    }
+    uint32_t *words = (uint32_t *) fb_addr;
+    uint32_t n_words = debug_stream_state.fb_size_bytes / sizeof(uint32_t);
+    uint16_t pix = 0, filler = 0, trig = 0, other = 0, inv_xy = 0;
+
+    for (uint32_t i = 0; i < n_words; i++) {
+        uint32_t v = words[i];
+        uint32_t t = __EVT20_TYPE(v);
+        switch (t) {
+            case TD_LOW:
+            case TD_HIGH: {
+                uint32_t x = __EVT20_X(v);
+                uint32_t y = __EVT20_Y(v);
+                if (x >= ACTIVE_SENSOR_WIDTH || y >= ACTIVE_SENSOR_HEIGHT) {
+                    inv_xy++;
+                }
+                pix++;
+                break;
+            }
+            case EV_TIME_HIGH:
+                debug_stream_state.event_time_us = __EVT20_TIME_HIGH(v);
+                filler++;
+                break;
+            case EXT_TRIGGER:
+                trig++;
+                break;
+            default:
+                other++;
+                break;
+        }
+    }
+
+    uint32_t ts_us = (uint32_t) mp_hal_ticks_us();
+    uint32_t fb_idx = debug_stream_state.n_fbs;
+    uint16_t (*row)[DEBUG_STREAM_STATS_COLS] = &debug_stream_state.stats[fb_idx];
+    (*row)[0] = (uint16_t) (ts_us & 0xFFFF);
+    (*row)[1] = (uint16_t) ((ts_us >> 16) & 0xFFFF);
+    (*row)[2] = pix;
+    (*row)[3] = filler;
+    (*row)[4] = trig;
+    (*row)[5] = other;
+    (*row)[6] = inv_xy;
+    (*row)[7] = (uint16_t) (fb_idx & 0xFFFF);
+    debug_stream_state.n_fbs = fb_idx + 1;
+}
+
+extern int imx_csi_streaming_start(omv_csi_t *csi,
+                                   uint8_t *fb1, uint8_t *fb2,
+                                   uint16_t dma_line_bytes,
+                                   uint16_t height_lines,
+                                   void (*cb)(uint8_t *, void *),
+                                   void *arg);
+extern void imx_csi_streaming_stop(omv_csi_t *csi);
+#endif // OMV_CSI_HAS_IMAG_PARA_OVERRIDE
+
 static int set_active_mode(omv_csi_t *csi, genx_mode_t mode, int framesize);
 
 static int reset(omv_csi_t *csi) {
@@ -661,6 +749,102 @@ static int ioctl(omv_csi_t *csi, int request, va_list ap) {
             (void) out_buf;
             (void) out_size;
             (void) height_lines;
+            ret = OMV_CSI_ERROR_CTL_UNSUPPORTED;
+            #endif
+            break;
+        }
+        case OMV_CSI_IOCTL_GENX320_DEBUG_CAPTURE_CONTINUOUS: {
+            // Experimental: validates the continuous-DMA configuration the
+            // evtstream task-3 design will use in production. Configures the
+            // CSI peripheral with a small IMAG_PARA height in non-one_shot
+            // ping-pong mode and runs for `duration_ms` of wall-clock time.
+            // For each FB-done IRQ, decodes one row of stats into the
+            // caller's ndarray. Returns the number of rows written.
+            //
+            // Args: (uint16_t *stats_buf, uint32_t capacity_rows,
+            //        int height_lines, int duration_ms).
+            uint16_t *stats_buf = (uint16_t *) va_arg(ap, void *);
+            uint32_t capacity = va_arg(ap, uint32_t);
+            int height_lines = va_arg(ap, int);
+            int duration_ms = va_arg(ap, int);
+
+            #if defined(OMV_CSI_HAS_IMAG_PARA_OVERRIDE) && (OMV_CSI_HAS_IMAG_PARA_OVERRIDE == 1)
+            if (genx->mode != OMV_CSI_GENX320_MODE_EVENT) {
+                ret = OMV_CSI_ERROR_CTL_FAILED;
+                break;
+            }
+            if (omv_csi_get_cropped(csi) || csi->transpose) {
+                ret = OMV_CSI_ERROR_CAPTURE_FAILED;
+                break;
+            }
+            int max_h = csi->resolution[csi->framesize][1];
+            if (height_lines < 1
+                || height_lines > max_h
+                || height_lines > DEBUG_STREAM_MAX_HEIGHT) {
+                ret = OMV_CSI_ERROR_INVALID_ARGUMENT;
+                break;
+            }
+            if (duration_ms < 1 || duration_ms > 10000) {
+                ret = OMV_CSI_ERROR_INVALID_ARGUMENT;
+                break;
+            }
+            if (capacity == 0) {
+                ret = OMV_CSI_ERROR_INVALID_ARGUMENT;
+                break;
+            }
+
+            uint16_t dma_line_bytes = (uint16_t) csi->resolution[csi->framesize][0];
+            if ((uint32_t) dma_line_bytes != 1024) {
+                // Spec assumption from genx320 set_active_mode(MODE_EVENT).
+                // If this changes upstream the DEBUG_STREAM_MAX_FB_BYTES
+                // bound and the script's geometry calculations need a look.
+                ret = OMV_CSI_ERROR_CTL_FAILED;
+                break;
+            }
+            uint32_t fb_size = (uint32_t) dma_line_bytes * (uint32_t) height_lines;
+            if (fb_size > DEBUG_STREAM_MAX_FB_BYTES) {
+                ret = OMV_CSI_ERROR_INVALID_ARGUMENT;
+                break;
+            }
+
+            // Initialize streaming state. Done before start_streaming so the
+            // first IRQ writes into a coherent struct.
+            debug_stream_state.stats =
+                (uint16_t (*)[DEBUG_STREAM_STATS_COLS]) stats_buf;
+            debug_stream_state.capacity = capacity;
+            debug_stream_state.n_fbs = 0;
+            debug_stream_state.fb_size_bytes = fb_size;
+            debug_stream_state.event_time_us = 0;
+
+            int rc = imx_csi_streaming_start(csi,
+                                             debug_stream_fb1, debug_stream_fb2,
+                                             dma_line_bytes,
+                                             (uint16_t) height_lines,
+                                             debug_stream_decode_cb, NULL);
+            if (rc != 0) {
+                ret = rc;
+                break;
+            }
+
+            // Wait for the requested wall-clock window. mp_event_handle_nowait
+            // lets MicroPython service KeyboardInterrupt etc.
+            mp_uint_t start_ms = mp_hal_ticks_ms();
+            while ((mp_hal_ticks_ms() - start_ms) < (mp_uint_t) duration_ms) {
+                mp_event_handle_nowait();
+            }
+
+            imx_csi_streaming_stop(csi);
+
+            // Force-invalidate the framebuffer so subsequent normal snapshots
+            // restart from a known state.
+            csi->fb->pixfmt = PIXFORMAT_INVALID;
+
+            ret = (int) debug_stream_state.n_fbs;
+            #else
+            (void) stats_buf;
+            (void) capacity;
+            (void) height_lines;
+            (void) duration_ms;
             ret = OMV_CSI_ERROR_CTL_UNSUPPORTED;
             #endif
             break;
