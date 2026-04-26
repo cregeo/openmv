@@ -210,56 +210,111 @@ report("SHRUNKEN", SHRUNKEN_HEIGHT, shrunk_stats)
 
 
 # Verdict ----------------------------------------------------------------
+#
+# PASS requires ALL of the following. The earlier "byte count ratio matches
+# the height ratio" criterion was insufficient: it only proved that the
+# DMA peripheral copies the requested number of bytes, not that the bytes
+# represent equivalent event data. A real run on hardware showed PASS by
+# the old criterion while the shrunken capture was actually missing 80%
+# of pixel events (filler-dominated stream). Stricter checks below.
+
+print()
+print("=" * 64)
+print(" Stricter PASS criteria")
+print("=" * 64)
+
+reasons = []
+geo_ratio = SHRUNKEN_HEIGHT / DEFAULT_HEIGHT  # expected geometric ratio
+
+
+def assert_check(label, ok, detail):
+    print(" %-26s : %s    %s" % (label, "OK  " if ok else "FAIL", detail))
+    if not ok:
+        reasons.append("%s — %s" % (label, detail))
+
+
+# (0) Both captures produced data at all.
+assert_check("default returned bytes",
+             n_default > 0,
+             "%d bytes" % n_default)
+assert_check("shrunken returned bytes",
+             n_shrunk > 0,
+             "%d bytes" % n_shrunk)
+
+if n_default > 0 and n_shrunk > 0:
+    # (1) Word count ratio matches geometry within 5% — proves DMA byte
+    #     accounting is correct. (Necessary but not sufficient.)
+    word_ratio = shrunk_stats["n_words"] / float(default_stats["n_words"])
+    word_ratio_ok = abs(word_ratio - geo_ratio) <= geo_ratio * 0.05
+    assert_check("word ratio == geometry",
+                 word_ratio_ok,
+                 "%.3f vs expected %.3f (+/- 5%%)" %
+                 (word_ratio, geo_ratio))
+
+    # (2) Pixel-event count within +/- 25% of geometric expectation.
+    #     Captures are not simultaneous; +/- 25% absorbs scene jitter.
+    expected_pixels = default_stats["n_pixel"] * geo_ratio
+    pixel_lo = int(expected_pixels * 0.75)
+    pixel_hi = int(expected_pixels * 1.25)
+    pixels_ok = pixel_lo <= shrunk_stats["n_pixel"] <= pixel_hi
+    assert_check("pixel-event count",
+                 pixels_ok,
+                 "got %d, expected %d in [%d, %d]" %
+                 (shrunk_stats["n_pixel"], int(expected_pixels),
+                  pixel_lo, pixel_hi))
+
+    # (3) Pixel-events as a percentage of the stream within +/- 15
+    #     percentage points. This catches the failure mode where the
+    #     CSI captures the same number of bytes but they are dominated
+    #     by EV_TIME_HIGH filler words instead of real pixel events.
+    default_pix_pct = (100.0 * default_stats["n_pixel"]
+                       / default_stats["n_words"])
+    shrunk_pix_pct = (100.0 * shrunk_stats["n_pixel"]
+                      / shrunk_stats["n_words"])
+    pix_pct_ok = abs(shrunk_pix_pct - default_pix_pct) <= 15.0
+    assert_check("pixel/total ratio (%)",
+                 pix_pct_ok,
+                 "shrunken=%.1f%% vs default=%.1f%% (+/- 15 pp)" %
+                 (shrunk_pix_pct, default_pix_pct))
+
+    # (4) EV_TIME_HIGH word count within +/- 50% of geometric
+    #     expectation. Wider tolerance because EV_TIME_HIGH cadence has
+    #     intrinsic jitter; tighter than 50% would false-positive.
+    expected_th = default_stats["n_time_high"] * geo_ratio
+    th_lo = int(expected_th * 0.5)
+    th_hi = int(expected_th * 1.5)
+    th_ok = th_lo <= shrunk_stats["n_time_high"] <= th_hi
+    assert_check("EV_TIME_HIGH count",
+                 th_ok,
+                 "got %d, expected %d in [%d, %d]" %
+                 (shrunk_stats["n_time_high"], int(expected_th),
+                  th_lo, th_hi))
+
+# (5) No timestamp monotonicity violations beyond the 2 expected at
+#     EV_TIME_HIGH boundaries.
+mono_ok = shrunk_stats["monotonic_violations"] <= 2
+assert_check("monotonicity violations",
+             mono_ok,
+             "%d (allowed up to 2)" % shrunk_stats["monotonic_violations"])
+
+# (6) No invalid x/y coordinates.
+xy_ok = shrunk_stats["n_pixel_invalid_xy"] == 0
+assert_check("invalid x/y coords",
+             xy_ok,
+             "%d (must be 0)" % shrunk_stats["n_pixel_invalid_xy"])
 
 print()
 print("=" * 64)
 print(" VERDICT")
 print("=" * 64)
-
-ok = True
-reasons = []
-
-if n_default <= 0:
-    ok = False
-    reasons.append("default capture returned %d bytes" % n_default)
-
-if n_shrunk <= 0:
-    ok = False
-    reasons.append("shrunken capture returned %d bytes" % n_shrunk)
-
-if shrunk_stats["n_pixel_invalid_xy"] > 0:
-    ok = False
-    reasons.append("shrunken capture has %d pixel events with x>=320 or y>=320"
-                   % shrunk_stats["n_pixel_invalid_xy"])
-
-if shrunk_stats["monotonic_violations"] > 2:
-    # 1-2 expected at EV_TIME_HIGH boundaries; >2 suggests desync.
-    ok = False
-    reasons.append("shrunken capture has %d timestamp monotonicity violations"
-                   % shrunk_stats["monotonic_violations"])
-
-if shrunk_stats["n_time_high"] == 0 and shrunk_stats["n_pixel"] > 0:
-    ok = False
-    reasons.append("shrunken capture has pixel events but zero EV_TIME_HIGH "
-                   "anchor words — timestamps would be unanchored")
-
-# Sanity: shrunken word count should be approximately
-# (SHRUNKEN_HEIGHT / DEFAULT_HEIGHT) of default. Allow +-50% slack since
-# the two captures are at different wall times.
-if default_stats["n_words"] > 0 and shrunk_stats["n_words"] > 0:
-    ratio = shrunk_stats["n_words"] / default_stats["n_words"]
-    expected = SHRUNKEN_HEIGHT / DEFAULT_HEIGHT
-    print(" shrunken/default word ratio: %.3f  (expected ~%.3f)" %
-          (ratio, expected))
-    # No FAIL here — captures are not simultaneous; we just print.
-
-if ok:
+if not reasons:
     print(" PASS — shrunken IMAG_PARA height yields a coherent EVT2.0 stream.")
     print("        Proceed with the evtstream task-3 main implementation.")
 else:
-    print(" FAIL — shrunken IMAG_PARA height is NOT coherent:")
+    print(" FAIL — shrunken IMAG_PARA height is NOT coherent. Reasons:")
     for r in reasons:
         print("        - %s" % r)
-    print("        Stop and write RISK1_FINDINGS.md before further work.")
-
+    print()
+    print("        Read RISK1_FINDINGS.md at the repo root before further")
+    print("        work. Do not proceed to Task 3 main implementation.")
 print("=" * 64)
