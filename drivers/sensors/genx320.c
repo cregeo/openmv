@@ -90,20 +90,21 @@ typedef struct genx_state {
 static genx_state_t genx = {};
 
 #if defined(OMV_CSI_HAS_IMAG_PARA_OVERRIDE) && (OMV_CSI_HAS_IMAG_PARA_OVERRIDE == 1)
-// Experimental: buffers and state for the GENX320_DEBUG_CAPTURE_CONTINUOUS
-// IOCTL. These live in DTCM (default for BSS on RT1062, per
-// OMV_MAIN_MEMORY = DTCM in boards/OPENMV_RT1060/omv_boardconfig.h) so the
-// CSI's DMA writes are non-cacheable and the IRQ-context decoder can read
-// them without manual cache invalidation. Sized for up to 8 lines × 1024
-// bytes per FB; we expose `height_lines` to Python but cap at 8.
+// Experimental: state for the GENX320_DEBUG_CAPTURE_CONTINUOUS IOCTL.
+//
+// FB1 / FB2 ping-pong buffers are allocated via fb_alloc() at IOCTL
+// invocation time and freed before return. They live in DRAM
+// (OMV_FB_MEMORY = DRAM on this board) — DTCM-static buffers were tried
+// first but overflowed the 384 KB DTCM region (OpenMV's own data already
+// occupies most of it). DRAM is cacheable; the port-side line-callback
+// hook calls SCB_InvalidateDCache_by_Addr before handing the FB to our
+// decode callback so the CPU sees fresh DMA writes.
+//
+// Sized for up to 8 lines × 1024 bytes per FB; we expose `height_lines`
+// to Python but cap at DEBUG_STREAM_MAX_HEIGHT.
 #define DEBUG_STREAM_MAX_FB_BYTES   (8 * 1024)
 #define DEBUG_STREAM_MAX_HEIGHT     (8)
 #define DEBUG_STREAM_STATS_COLS     (8)
-
-static uint8_t debug_stream_fb1[DEBUG_STREAM_MAX_FB_BYTES]
-    __attribute__((aligned(64)));
-static uint8_t debug_stream_fb2[DEBUG_STREAM_MAX_FB_BYTES]
-    __attribute__((aligned(64)));
 
 static struct {
     uint16_t (*stats)[DEBUG_STREAM_STATS_COLS];
@@ -807,6 +808,11 @@ static int ioctl(omv_csi_t *csi, int request, va_list ap) {
                 break;
             }
 
+            // Allocate two FB buffers from the framebuffer arena (DRAM).
+            // fb_alloc / fb_free are LIFO: free fb2 first, then fb1.
+            uint8_t *fb1 = fb_alloc(fb_size, FB_ALLOC_NO_HINT);
+            uint8_t *fb2 = fb_alloc(fb_size, FB_ALLOC_NO_HINT);
+
             // Initialize streaming state. Done before start_streaming so the
             // first IRQ writes into a coherent struct.
             debug_stream_state.stats =
@@ -817,11 +823,13 @@ static int ioctl(omv_csi_t *csi, int request, va_list ap) {
             debug_stream_state.event_time_us = 0;
 
             int rc = imx_csi_streaming_start(csi,
-                                             debug_stream_fb1, debug_stream_fb2,
+                                             fb1, fb2,
                                              dma_line_bytes,
                                              (uint16_t) height_lines,
                                              debug_stream_decode_cb, NULL);
             if (rc != 0) {
+                fb_free();  // fb2
+                fb_free();  // fb1
                 ret = rc;
                 break;
             }
@@ -834,6 +842,10 @@ static int ioctl(omv_csi_t *csi, int request, va_list ap) {
             }
 
             imx_csi_streaming_stop(csi);
+
+            // Free FB buffers in reverse-allocation order.
+            fb_free();  // fb2
+            fb_free();  // fb1
 
             // Force-invalidate the framebuffer so subsequent normal snapshots
             // restart from a known state.

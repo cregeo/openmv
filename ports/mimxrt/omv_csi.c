@@ -67,6 +67,11 @@ uint16_t omv_csi_imag_para_height_override = 0;
 volatile bool omv_csi_streaming_active = false;
 void (*omv_csi_streaming_cb)(uint8_t *fb_addr, void *arg) = NULL;
 void *omv_csi_streaming_arg = NULL;
+// Size of each ping-pong FB. Used by the line-callback hook to invalidate
+// the D-cache range before handing the buffer to the user callback, so
+// the callback sees fresh DMA writes rather than stale cached lines. Set
+// at imx_csi_streaming_start() time, cleared by _stop().
+uint32_t omv_csi_streaming_fb_size_bytes = 0;
 
 #define CSI_IRQ_FLAGS    (CSI_CR1_SOF_INTEN_MASK            \
                           | CSI_CR1_FB2_DMA_DONE_INTEN_MASK \
@@ -230,6 +235,13 @@ void omv_csi_line_callback(omv_csi_t *csi, uint32_t addr) {
     // no EDMA line copy. Runs in CSI IRQ context — keep callback bounded.
     if (omv_csi_streaming_active) {
         if (omv_csi_streaming_cb != NULL) {
+            #ifdef __DCACHE_PRESENT
+            // CSI DMA writes go straight to physical memory; if the FB lives
+            // in a cacheable region (e.g. DRAM via fb_alloc), the CPU may
+            // see stale cache lines. Invalidate before handing off.
+            SCB_InvalidateDCache_by_Addr((uint32_t *) addr,
+                                         omv_csi_streaming_fb_size_bytes);
+            #endif
             omv_csi_streaming_cb((uint8_t *) addr, omv_csi_streaming_arg);
         }
         return;
@@ -577,6 +589,7 @@ int imx_csi_streaming_start(omv_csi_t *csi,
     // jump through a half-initialized hook.
     omv_csi_streaming_cb = cb;
     omv_csi_streaming_arg = arg;
+    omv_csi_streaming_fb_size_bytes = total;
     __DSB();
     omv_csi_streaming_active = true;
 
@@ -602,5 +615,6 @@ void imx_csi_streaming_stop(omv_csi_t *csi) {
 
     omv_csi_streaming_cb = NULL;
     omv_csi_streaming_arg = NULL;
+    omv_csi_streaming_fb_size_bytes = 0;
 }
 #endif // MICROPY_PY_CSI
