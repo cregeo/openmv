@@ -221,60 +221,260 @@ different designs. One small targeted test discriminates them and lets
 us pick C-frame (sufficient if B), C-line (sufficient if A), or
 recognise that we need a deeper rethink.
 
-### Use-case fit
+### Use-case fit — see §7a for the latency derivation that backs this
 
 | Requirement              | Source         | C-frame fit | C-line fit |
 |--------------------------|----------------|-------------|------------|
-| 5 ms latency budget      | NIR re-seed    | yes (≤4 ms at typical rate) | yes (≤1 ms) |
+| ≤5 ms saccade latency    | NIR re-seed    | yes — 1.4 ms DMA fill + 1 ms PIT + ~1 ms USB | yes — sub-ms |
+| Fixation latency unbounded | Use case     | yes         | yes        |
 | 1 kHz packet cadence     | Tracker spec   | yes (PIT)   | yes (PIT)  |
 | 50K evt/s nominal load   | Eye scenes     | yes         | yes        |
-| 500K evt/s burst (blink) | Blink physics  | yes (≤1.4 ms decode IRQ) | yes (per-line) |
-| ISR CPU < 20%            | Headroom       | yes (~5%)   | borderline (~16%) |
+| 500K evt/s saccade rate  | Saccade physics| yes         | yes        |
+| ISR CPU < 5%             | Headroom       | yes (~0.7%) | unmeasured — pending §8d |
 
-**Default to C-frame with 4 KB buffers**. Escalate to C-line only if
-follow-up validation shows C-frame still loses events.
+**Default to C-frame with 4 KB buffers (h=4 lines)**. Latency budget for the
+eye-tracking use case is met during saccades (when it matters) and explicitly
+relaxed during fixation (when NIR ground truth carries the tracker). Do not
+proceed to C-line speculatively — see §8c.
+
+---
+
+## 7a. Latency derivation
+
+The earlier draft of §6/§7 conflated two distinct quantities. Separating
+them properly:
+
+### Components
+
+The end-to-end latency from a sensor event being emitted to that event
+landing in a Jetson packet is the sum of three terms:
+
+| Term              | Formula                                              | Bound        |
+|-------------------|------------------------------------------------------|--------------|
+| **DMA fill latency** `L_fill` | (FB_size_bytes / wire_byte_rate)        | per-FB time  |
+| **PIT drain latency** `L_pit` | (≤ window_us = 1000 µs)                 | one window   |
+| **USB CDC latency** `L_usb`   | (host scheduling, ~1 ms typ., spike-prone) | ≈ 1–3 ms |
+| **Total**         | `L_fill + L_pit + L_usb`                              | sum          |
+
+`L_fill` is the dominant term. It is *not* the average decode interval
+(events arrive in the ring as soon as their FB completes); it is the
+worst-case wait for the very first event of a new FB to be processable.
+At any given instant the in-flight FB has been filling for between 0 and
+`FB_size_bytes / wire_byte_rate` of wall-clock time.
+
+`wire_byte_rate` includes both pixel events and EV_TIME_HIGH filler. From
+the validation data the wire was ~70/30 split pixel-vs-filler at
+fixation activity. So at a given pixel-event rate, multiply by ~1.4× to
+get wire word rate, then by 4 to get bytes.
+
+### Saccade vs fixation
+
+Eye-tracking event-stream latency only matters during **saccades**:
+
+- **Fixation** (eye is still): pupil position changes are sub-pixel. NIR
+  ground truth at 100 Hz handles position estimation. Event-stream
+  latency does not affect tracker quality.
+- **Saccade** (eye is moving): pupil moves several pixels per ms. NIR
+  re-seeds at 100 Hz aren't enough; the event stream must keep up. This
+  is when the 5 ms latency budget applies (half the NIR re-seed
+  interval).
+
+Saccade event rates are high (saccades produce ~50–200K pupil-edge
+events/sec while moving; this dominates the wire). So our latency
+analysis must be sized for **high event rate**, where DMA fills quickly
+and `L_fill` is small.
+
+### Worked numbers at h=4 lines (4 KB FB)
+
+`dma_line_bytes = 1024` for GenX320 EVENT mode (sensor's CPI line width).
+At h=4 lines the FB is 4 KB / 1024 EVT2.0 words / ~700 pixel-event capacity.
+
+| Scenario        | Pixel rate | Wire byte rate | `L_fill` | Total latency |
+|-----------------|-----------:|---------------:|---------:|--------------:|
+| Fixation        |    50K/s   |    ~280 KB/s   |  ~14 ms  |  ~16 ms (OK)  |
+| Onset transition|    rising  |    rising      |  ≤1.4 ms |  ≤3.4 ms (OK) |
+| Saccade peak    |   500K/s   |    ~2.8 MB/s   |  ~1.4 ms |   ~3.4 ms (OK) |
+| Blink burst     |   1M/s+    |    ~5.6 MB/s+  |  ~0.7 ms |   ~2.7 ms (OK) |
+
+The fixation row's 16 ms exceeds the budget; that's accepted per the
+saccade-vs-fixation framing. Every other row is comfortably under 5 ms.
+
+### Why not 1 KB or 2 KB?
+
+The pushback raised whether smaller buffers (1 KB / 2 KB) would do
+better. Working through it:
+
+| Size  | Saccade `L_fill` | Onset `L_fill` (worst) | Saccade IRQ rate | IRQ CPU at saccade |
+|-------|------------------:|-----------------------:|-----------------:|-------------------:|
+| 1 KB  |  0.36 ms          |  0.36 ms               |  ~2,734 / s      |  ~0.8%             |
+| 2 KB  |  0.72 ms          |  0.72 ms               |  ~1,367 / s      |  ~0.7%             |
+| 4 KB  |  1.4 ms           |  1.4 ms                |  ~683 / s        |  ~0.7%             |
+
+All three meet the budget cleanly. Smaller is faster but with diminishing
+returns, and the IRQ overhead is negligible at all three sizes. No
+operational reason picks 1 or 2 over 4.
+
+**Default: h=4 (4 KB FB).** Recommended for the design.
+
+But: the validation patch in §8a exposes `height_lines` as a Python
+parameter so the next hardware run can sweep h ∈ {1, 2, 4, 8} cheaply.
+If the data surfaces a reason to prefer a different size, we revise
+before locking the design.
+
+### Caveats baked into this derivation
+
+1. **Ground truth wire rate is from the failed snapshot validation.** The
+   70/30 pixel/filler split is from a specific scene (waving hand). At
+   true saccade rates the ratio likely shifts toward 90+% pixel as the
+   sensor saturates. Re-derive after the §8 follow-up validation
+   produces a clean continuous-mode wire rate.
+2. **`L_usb` of ~1 ms is unverified.** The original DESIGN.md §9 Risk #3
+   flagged this; the synthetic CDC benchmark in task3 instructions §6 is
+   the artifact that confirms or refutes it. Don't trust the 1 ms
+   estimate yet — it just isn't the bottleneck if it's anywhere near
+   correct.
+3. **First-FB transient.** When CSI is first armed in continuous mode,
+   FB1 fills from a randomly-aligned moment in the wire stream. The
+   first FB-done IRQ may be unrepresentative. The validation patch in
+   §8a captures per-FB stats so we can see the transient and exclude it
+   from steady-state analysis.
 
 ---
 
 ## 8. What we need from cregeo
 
 A second validation patch + run, on the same hardware, before any main
-module work:
+module work.
 
-### 8a. Patch (I will write it; small)
+**Lesson from the first validation, baked into this one**: the original
+`DEBUG_CAPTURE` IOCTL exercised the snapshot-per-call lifecycle, which
+is *not* the configuration the production design will use. The follow-up
+validation must exercise the *actual* production configuration —
+continuous ping-pong DMA — or its result is moot.
 
-Extend `OMV_CSI_IOCTL_GENX320_DEBUG_CAPTURE` (or add a sibling IOCTL)
-with a "continuous mode" flavor that:
+### 8a. Patch — continuous-mode validation IOCTL
 
-1. Configures the CSI peripheral with `IMAG_PARA` height shrunk to e.g.
-   13 lines AND `one_shot = false` (continuous ping-pong).
-2. Lets DMA run continuously into FB1/FB2 for a fixed wall-clock window
-   (e.g. 1 second).
-3. On every FB-done IRQ, decodes events into a host-side ring buffer.
-4. Returns the decoded events to the caller for the same coherence
-   checks the current script runs.
+Add a sibling IOCTL `OMV_CSI_IOCTL_GENX320_DEBUG_CAPTURE_CONTINUOUS`
+(0x28). Keep the original `DEBUG_CAPTURE` (0x27) intact so we can run
+side-by-side comparisons if needed during analysis. Implementation
+sketch:
 
-This is the same statistical comparison (default vs shrunken) but with
-the actual continuous-DMA configuration the design will use, not the
-snapshot-per-call lifecycle.
+1. Configure the CSI peripheral in **non-`one_shot` mode** with
+   `IMAG_PARA` height set per the §7a recommendation (default h=4
+   lines, but exposed as a Python argument so we can sweep).
+2. Allocate two FB buffers (sized `height_lines × dma_line_bytes`)
+   and point `CSI_REG_DMASA_FB1` / `_FB2` at them. CSI ping-pongs
+   FB1↔FB2 with no off-time between them.
+3. Install a CSI-IRQ hook (in `ports/mimxrt/omv_csi.c`) that bypasses
+   the existing `omv_csi_line_callback` line-copy path and instead
+   calls our event-decode-from-FB function on every FB-done IRQ.
+4. Run for a caller-specified `duration_ms` of wall-clock time.
+5. Per-FB, accumulate stats (pixel count, EV_TIME_HIGH count,
+   trigger count, invalid-xy count, FB-completion timestamp) into a
+   caller-provided ndarray.
+6. After the window expires, stop CSI cleanly and return the per-FB
+   stats array.
+
+Python interface (final shape):
+
+```python
+# Per-FB stats: (n_fbs, 8) uint16 array, one row per FB-done IRQ.
+# Columns: ts_us_lo, ts_us_hi, pixels, fillers, triggers, others, invalid_xy, reserved
+stats = np.zeros((MAX_FBS, 8), dtype=np.uint16)
+n_fbs = csi0.ioctl(csi.IOCTL_GENX320_DEBUG_CAPTURE_CONTINUOUS,
+                   stats, height_lines, duration_ms)
+```
 
 ### 8b. Run on hardware
 
-Same procedure as the current validation: wave hand / LED, run the
-script, paste the output.
+Same procedure as the first validation. Suggested sweep:
 
-### 8c. Decision criteria
+1. Run with `height_lines=4, duration_ms=1000` (the design default).
+2. Run with `height_lines=2` and `=1` to sanity-check that the answer
+   doesn't depend on the specific size.
+3. Optional: run with `height_lines=16` to compare against the original
+   snapshot-mode default-height capture.
 
-- If continuous-DMA shrunken capture passes the stricter criteria →
-  **Option C-frame is viable**, original Option B design holds (with
-  the small change of "always run continuous, never snapshot-per-call").
-- If continuous-DMA shrunken still fails on pixel-event count or pixel/
-  total ratio → **escalate to C-line**, write a third validation patch
-  using IMAG_PARA height = 1 + per-line decode.
-- If C-line also fails → genuinely a sensor-side issue (Hypothesis A
-  partly correct, sensor's CPI block can't service tight pacing). Then
-  we revisit: B-modified with looser latency, or accept Option A with
-  the use case implications spelled out.
+The script will print aggregate stats AND per-FB distribution analysis
+so the same log can be inspected for Hypothesis A vs B signature.
+
+### 8c. Decision criteria — strict
+
+Pass criteria for **continuous-mode capture at any tested
+`height_lines`**:
+
+1. Aggregate pixel-event count is within ±25 % of the geometric
+   expectation calibrated against a reference-height continuous-mode
+   capture in the same run.
+2. Pixel/total ratio across the run is within ±15 percentage points of
+   the reference-height capture in the same run.
+3. EV_TIME_HIGH count is within ±50 % of the geometric expectation.
+4. Per-FB pixel count distribution is **unimodal** with std dev ≤ 50%
+   of the mean (after excluding the first 2 FBs as transient). Bimodal
+   distribution would be the Hypothesis-A signature; if present we
+   stop and revisit.
+5. No timestamp monotonicity violations beyond the EV_TIME_HIGH
+   boundary count (≤ 2× the EV_TIME_HIGH count).
+6. No invalid x/y coordinates.
+
+If the script reports PASS at h=4, h=2, AND h=1: continuous-mode
+ping-pong DMA preserves event coherence at all relevant sizes →
+**Option C-frame is viable** → original Option B design holds with the
+clarification "always continuous, never snapshot-per-call". Proceed to
+Task 3 main implementation with h=4 as the default size.
+
+If the script reports FAIL at any tested size: **stop**. Do not
+escalate to C-line speculatively.
+
+### 8d. If C-frame fails — what to do *before* writing C-line
+
+C-line as sketched in §6 introduces a new unverified assumption: that
+the existing `imx_csi_line_callback` path can be repurposed for raw
+EVT2.0 word capture in non-JPEG pixformat. The callback was written
+for JPEG and grayscale-pixel-line copying; whether it can carry raw
+EVT2.0 words without modification is a research question, not an
+implementation step.
+
+If §8c produces a FAIL, the next deliverable is **NOT** another
+validation patch. It is a written analysis (`LINE_CALLBACK_ANALYSIS.md`)
+that:
+
+1. Reads `omv_csi_line_callback()` end-to-end and documents what each
+   branch does.
+2. Walks through what changes (if any) are needed for non-JPEG,
+   non-grayscale-pixel raw-word capture.
+3. Identifies whether `IMAG_PARA height = 1` actually gives per-line
+   FB-done IRQs in this CSI peripheral configuration, or whether the
+   semantics are different.
+4. Flags any state assumptions that the existing line-callback makes
+   that would be violated in evtstream's continuous mode (e.g.,
+   `framebuffer_acquire`/`framebuffer_release` ordering, EDMA channel
+   sharing, `vbuffer_t` ring lifecycle).
+
+Only after that document is reviewed and we agree C-line is feasible
+do I write the C-line validation patch.
+
+### 8e. If C-line analysis says it isn't feasible
+
+Then the options are:
+
+- **B-modified with relaxed latency budget**: accept that latency floor
+  is the FB fill time at typical (not saccade) event rate. With 4 KB
+  FBs at fixation 50K evt/s = ~14 ms latency. Combined with the
+  saccade-vs-fixation framing, this might be acceptable: at fixation
+  the tracker doesn't need fast events anyway. Worth re-evaluating
+  against the eye-tracker's actual saccade detection behavior.
+- **Accept `Option A revisited` with smaller frames**: configure the
+  GenX320 sensor's CPI packet size to a smaller value (currently
+  hard-coded at 320 × 320 in `set_active_mode`). This shrinks the
+  *sensor*-side frame, not the CSI's IMAG_PARA. May or may not be
+  supported by the sensor — Prophesee public registers should
+  document the lower bound; we'd need to read them.
+- **Reframe the use case**: drop the 1 kHz cadence target and run at
+  whatever cadence the sensor naturally produces, with MCU-side
+  timestamps so the Jetson can resequence.
+
+We pick from these in a third document if we get there.
 
 ---
 
