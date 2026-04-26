@@ -211,6 +211,88 @@ if cadence jitter exceeds budget.
 
 ---
 
+## 3a. DTCM budget — original §3 was wrong (added 2026-04-26)
+
+The "~64 KB total ... plenty of headroom" claim in §3 was incorrect.
+Building the RISK1 follow-up validation patch with two 8 KB ping-pong FB
+buffers as DTCM-resident `static` arrays overflowed the region:
+
+```
+region `DTCM' overflowed by 15552 bytes
+DTCM: 408768 B / 384 KB = 103.96%
+section `.dma.memory0' will not fit in region `DTCM'
+```
+
+OpenMV already places a lot in DTCM by default on this board:
+
+- `OMV_GC_BLOCK1_MEMORY = DTCM`, `OMV_GC_BLOCK1_SIZE = 271K` — main GC heap
+- `OMV_DMA_MEMORY = DTCM` — misc DMA buffers (including `_line_buf` at
+  `OMV_LINE_BUF_SIZE = 11 K`)
+- BSS / data sections default to DTCM via `OMV_MAIN_MEMORY = DTCM`
+- Plus stack lives in ITCM1, but other ITCM2 / OCRAM allocations
+  intersect with FlexRAM partitioning
+
+So most of the 384 KB DTCM is already spoken for. The §3 budget assumed
+a budget that doesn't exist.
+
+### Action item before Task 3 main implementation
+
+Run `arm-none-eabi-readelf -s build/bin/firmware.elf` (or
+`arm-none-eabi-size --format=sysv`) on a stock `OPENMV_RT1060` build
+without any evtstream changes, sum allocations in DTCM, and report
+actual free DTCM. Cregeo has the build environment; this can be done
+quickly when we get to Task 3 main. Until then the table below is
+provisional.
+
+### Revised tentative placement (provisional pending readelf)
+
+The hot-path latency budget tolerates DRAM-resident TX buffers — USB
+DMA reads from them, and the USB IRQ already handles cache coherency
+at packet-completion time. The ring buffer (written in CSI ISR, read
+in PIT ISR, both on the hot path) is more sensitive and should stay
+in DTCM if possible.
+
+| Buffer | Old placement (§3) | New placement | Notes |
+|---|---|---|---|
+| Decoded event ring (32 KB) | DTCM | **DTCM** if free, else OCRM2 | Hot path, CSI-ISR-write / PIT-ISR-read; minimize cache traffic |
+| Packet TX buffer A (16404 B) | DTCM | **OCRM1 or DRAM** | USB EHCI DMA reads from any AXI-attached memory; cache-clean before submit |
+| Packet TX buffer B (16404 B) | DTCM | **OCRM1 or DRAM** | Same as A |
+| EVT2.0 raw FB1/FB2 (8 KB) | DTCM | **DRAM via fb_alloc** | Same approach as the validation patch (fb_alloc + cache-invalidate in IRQ); allows arbitrary `height_lines` without static budget |
+| State struct (~128 B) | DTCM | **DTCM** | Tiny; touch-frequency justifies DTCM |
+
+DTCM additions for evtstream: ~32 KB (ring) + 128 B (state) ≈ 32 KB, vs.
+the original 73 KB. Achievable even with current DTCM pressure if we
+can free ~32 KB of headroom (or shave the GC heap by that much, which
+is also viable — 271 KB is generous).
+
+### Cache management for non-DTCM buffers
+
+- **TX buffers in OCRM1/DRAM**: PIT ISR fills the buffer, calls
+  `SCB_CleanDCache_by_Addr(buf, size)` to push CPU writes to physical
+  memory, then submits to USB. USB DMA reads from physical memory; no
+  cache aliasing. Already a well-trodden pattern in OpenMV
+  (`framebuffer.c:223` for the read direction).
+- **FB1/FB2 in DRAM via fb_alloc**: CSI ISR receives the just-completed
+  FB; the port-side line-callback hook calls
+  `SCB_InvalidateDCache_by_Addr(addr, size)` before handing to the
+  user callback. The validation patch already does this — same code
+  path will be used in production.
+
+### Why this matters now and not later
+
+If the DTCM budget had been correct in §3, the Task 3 implementation
+would proceed as planned. Since it isn't, we either (a) shave the GC
+heap (user-visible — affects how big a program can run), (b) move
+buffers to OCRM/DRAM (this section's recommendation, performance
+impact small), or (c) split the difference. Each option has different
+implications for the implementation. Surfacing this now — before any
+main-module code is written — keeps the budget revision scoped.
+
+If the readelf measurement comes back showing < 32 KB free DTCM, even
+the ring buffer has to move out and we re-evaluate latency.
+
+---
+
 ## 4. ISR / non-ISR responsibility split
 
 Three execution contexts:
