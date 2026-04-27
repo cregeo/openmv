@@ -53,6 +53,7 @@
 #   (Monotonicity is checked inside the C decoder; not surfaced here.)
 
 import csi
+import sys
 import time
 from ulab import numpy as np
 
@@ -76,6 +77,13 @@ EVT_NDARRAY_SIZE = 4096
 DMA_LINE_BYTES = 1024  # set by genx320 driver in MODE_EVENT
 
 WAIT_BEFORE_CAPTURE_S = 1.0
+
+# Set to True for a diagnostic run that prints up to 50 per-FB rows per
+# height. The full output is large (~100+ lines) and on slow consoles
+# (OpenMV IDE over USB CDC) can push the verdict block off-screen. Default
+# False so the verdict is the most-recent thing on the console; flip to
+# True when you actually want to inspect per-FB distribution.
+PRINT_PER_FB_LOG = False
 
 
 # Helpers ----------------------------------------------------------------
@@ -296,8 +304,15 @@ for h in HEIGHTS:
     for r in reasons:
         print("    - %s" % r)
 
-print("OVERALL: %s" % ("PASS" if overall_pass else "FAIL"))
+overall_line = "OVERALL: %s" % ("PASS" if overall_pass else "FAIL")
+print(overall_line)
 print("=== VERDICT END ===")
+# Mirror to stderr so the verdict survives stdout buffering / IDE
+# truncation. stderr in MicroPython on this port is unbuffered by default.
+try:
+    sys.stderr.write(overall_line + "\n")
+except (AttributeError, OSError):
+    pass
 
 
 # Phase 3: detailed per-height reports.
@@ -315,17 +330,22 @@ for h in HEIGHTS:
 
 
 # Phase 4: per-FB log (last; safe to truncate without losing the verdict).
-print()
-print("=" * 70)
-print(" Per-FB log (truncatable; verdict is above)")
-print("=" * 70)
-for h in HEIGHTS:
-    snap, s = results[h]
-    if snap is not None:
-        print_per_fb_rows("h=%d" % h, snap)
+# Opt-in via PRINT_PER_FB_LOG so the default run keeps the verdict on screen.
+if PRINT_PER_FB_LOG:
+    print()
+    print("=" * 70)
+    print(" Per-FB log (truncatable; verdict is above)")
+    print("=" * 70)
+    for h in HEIGHTS:
+        snap, s = results[h]
+        if snap is not None:
+            print_per_fb_rows("h=%d" % h, snap)
 
 
-# Phase 5: trailing reminder — overall verdict, repeated.
+# Phase 5: trailing reminder — overall verdict, repeated. Even if Phase 4
+# fills the console buffer, this trailing block is the last thing flushed
+# and is therefore the most likely to survive an IDE-side truncation of
+# the long log.
 print()
 print("=" * 70)
 print(" OVERALL: %s" % ("PASS" if overall_pass else "FAIL"))
