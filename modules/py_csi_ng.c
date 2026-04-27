@@ -54,6 +54,21 @@
 #include "ndarray.h"
 #endif
 
+// CSI exclusivity hook (DESIGN.md / task3 step 6). When evtstream is
+// running, all user-level CSI operations refuse with OSError(EBUSY) so
+// they can't disturb the in-flight DMA / decode pipeline.
+#if MICROPY_PY_EVTSTREAM
+#include "py/mperrno.h"
+extern bool evtstream_is_running(void);
+#define EVTSTREAM_REFUSE_IF_RUNNING() do { \
+        if (evtstream_is_running()) { \
+            mp_raise_OSError(MP_EBUSY); \
+        } \
+    } while (0)
+#else
+#define EVTSTREAM_REFUSE_IF_RUNNING() do {} while (0)
+#endif
+
 #define omv_csi_raise_error(err) \
     mp_raise_msg(&mp_type_RuntimeError, (mp_rom_error_text_t) omv_csi_strerror(err))
 
@@ -133,6 +148,7 @@ static mp_obj_t py_csi_deinit(mp_obj_t self_in) {
 static MP_DEFINE_CONST_FUN_OBJ_1(py_csi_deinit_obj, py_csi_deinit);
 
 static mp_obj_t py_csi_reset(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    EVTSTREAM_REFUSE_IF_RUNNING();
     enum { ARG_hard };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_hard, MP_ARG_BOOL | MP_ARG_KW_ONLY,  {.u_bool = true} },
@@ -186,6 +202,7 @@ static mp_obj_t py_csi_flush(mp_obj_t self_in) {
 static MP_DEFINE_CONST_FUN_OBJ_1(py_csi_flush_obj, py_csi_flush);
 
 static mp_obj_t py_csi_snapshot(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    EVTSTREAM_REFUSE_IF_RUNNING();
     enum { ARG_time, ARG_frames, ARG_update, ARG_blocking, ARG_image };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_time, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
@@ -900,6 +917,7 @@ static mp_obj_t py_csi_frame_callback(size_t n_args, const mp_obj_t *args) {
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(py_csi_frame_callback_obj, 1, 2, py_csi_frame_callback);
 
 static mp_obj_t py_csi_ioctl(size_t n_args, const mp_obj_t *args) {
+    EVTSTREAM_REFUSE_IF_RUNNING();
     py_csi_obj_t *self = MP_OBJ_TO_PTR(args[0]);
     int request = mp_obj_get_int(args[1]);
 

@@ -51,6 +51,21 @@
 #include "py_helper.h"
 #include "framebuffer.h"
 
+// CSI exclusivity hook (DESIGN.md / task3 step 6). When evtstream is
+// running, all user-level CSI operations refuse with OSError(EBUSY) so
+// they can't disturb the in-flight DMA / decode pipeline.
+#if MICROPY_PY_EVTSTREAM
+#include "py/mperrno.h"
+extern bool evtstream_is_running(void);
+#define EVTSTREAM_REFUSE_IF_RUNNING() do { \
+        if (evtstream_is_running()) { \
+            mp_raise_OSError(MP_EBUSY); \
+        } \
+    } while (0)
+#else
+#define EVTSTREAM_REFUSE_IF_RUNNING() do {} while (0)
+#endif
+
 static mp_obj_t vsync_callback = mp_const_none;
 static mp_obj_t frame_callback = mp_const_none;
 
@@ -104,6 +119,7 @@ static mp_obj_t py_omv_csi__init__() {
 static MP_DEFINE_CONST_FUN_OBJ_0(py_omv_csi__init__obj, py_omv_csi__init__);
 
 static mp_obj_t py_omv_csi_reset() {
+    EVTSTREAM_REFUSE_IF_RUNNING();
     omv_csi_t *csi = omv_csi_get(-1);
 
     int error = omv_csi_reset(csi, true);
@@ -145,6 +161,7 @@ static mp_obj_t py_omv_csi_flush() {
 static MP_DEFINE_CONST_FUN_OBJ_0(py_omv_csi_flush_obj, py_omv_csi_flush);
 
 static mp_obj_t py_omv_csi_snapshot(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {
+    EVTSTREAM_REFUSE_IF_RUNNING();
     omv_csi_t *csi = omv_csi_get(-1);
 
     #if MICROPY_PY_IMU
@@ -828,6 +845,7 @@ static mp_obj_t py_omv_csi_set_frame_callback(mp_obj_t frame_callback_obj) {
 static MP_DEFINE_CONST_FUN_OBJ_1(py_omv_csi_set_frame_callback_obj, py_omv_csi_set_frame_callback);
 
 static mp_obj_t py_omv_csi_ioctl(size_t n_args, const mp_obj_t *args) {
+    EVTSTREAM_REFUSE_IF_RUNNING();
     omv_csi_t *csi = omv_csi_get(-1);
     mp_obj_t ret_obj = mp_const_none;
     int request = mp_obj_get_int(args[0]);

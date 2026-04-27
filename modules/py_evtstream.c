@@ -158,6 +158,21 @@ _Static_assert((EVTSTREAM_RING_CAP & EVTSTREAM_RING_MASK) == 0,
 // from context.
 #define EVTSTREAM_PIT_NVIC_PRIO  (10)
 
+// Cross-module accessor: returns true while ANY evtstream mode is
+// active (production start(), or any of the bench_*() entries). The
+// CSI exclusivity hook (step 6) calls this from py_csi.c / py_csi_ng.c
+// to refuse user-level CSI operations that would disturb the running
+// pipeline. Defined non-static + with a public-ish name so the extern
+// declarations on the consumer side can resolve at link time. No
+// header file because the consumer set is tiny and stable.
+//
+// Returns the simple `running` flag rather than a mode-specific
+// predicate: even bench() / bench_cache() (which don't own CSI) hold
+// the flag, and refusing CSI ops during them is harmless and
+// conservatively safer than letting two evtstream-affecting paths
+// race.
+bool evtstream_is_running(void);  // forward decl, definition after state
+
 // Module state. All zero-initialised in BSS until start() touches it.
 // Keep this struct DTCM-resident even in production — it's tiny (~64 B
 // here, ~128 B with all the runtime fields added in later steps), so it
@@ -249,6 +264,10 @@ static struct {
     volatile uint32_t last_window_us;
     volatile uint32_t sequence;
 } evtstream_state;
+
+bool evtstream_is_running(void) {
+    return evtstream_state.running;
+}
 
 // Build a synthetic packet (header + counter-pattern events) into `buf`
 // and ship it via tinyusb CDC. Drops the entire packet (no partial
