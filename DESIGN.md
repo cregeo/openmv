@@ -641,21 +641,38 @@ mode in `py_evtstream.c` (gated by a Python entry point, e.g.
    - **Read back & verify**: a follow-up read inside the same IRQ
      reads the buffer and checks the counter values match. If the cache
      management is wrong, mismatches will show up here.
-   - **TX direction**: write a counter pattern into a TX buffer, call
-     `SCB_CleanDCache_by_Addr`, then read back via a `volatile` non-
-     cached alias of the same DRAM region (using a different MPU view,
-     or simply by reading after a pipeline flush) to verify the cache
-     was actually flushed.
+   - **TX direction (best-effort, partially verifiable)**: write a
+     counter pattern into a TX buffer, call `SCB_CleanDCache_by_Addr`,
+     and run a follow-up read after a `__DSB()`. This confirms the
+     SCB call doesn't crash and that the buffer holds the expected
+     bytes — but it does *not* prove the cache lines actually reached
+     physical DRAM, since the M7 will hit its own clean cache on the
+     follow-up read. True end-to-end TX-direction verification needs
+     a separate bus master reading the cache-bypass path; the cleanest
+     such master in this system is USB EHCI DMA itself.
 3. Runs at the production PIT rate (1 kHz) for 10 seconds.
 4. Reports counters via `stats()`: cache mismatches, sequence gaps,
    SCB call counts, total bytes round-tripped.
 
-PASS criteria: zero cache mismatches over 10 seconds at 1 kHz cadence.
+PASS criteria for step 3a: zero ring/FB-direction mismatches over 10
+seconds at 1 kHz cadence. The TX-direction is *expected* to round-trip
+cleanly in this test — that result tells us the SCB call sequence
+doesn't crash, not that the cache reached DRAM.
+
+**Real TX-direction verification happens at step 5 (full path):** if
+the Jetson-side reader runs cleanly with no magic-byte resync events
+under sustained load, the TX cache-clean is working in production.
+That's the load-bearing test for this direction; bench_cache() is the
+load-bearing test for the ring/FB direction only.
+
+This split is honest about what each test actually proves. Don't
+over-engineer bench_cache() to chase symbolic TX verification — the
+gain is small and step 5 covers it for real.
 
 This is cheap to write (few hundred lines), runs without sensor
 hardware, and decouples the cache-correctness verification from the
-CSI integration. If it passes, we know the cache pattern is solid
-before adding the CSI complexity. If it fails, we debug cache
+CSI integration. If it passes, we know the ring/FB cache pattern is
+solid before adding the CSI complexity. If it fails, we debug cache
 ordering in isolation rather than amid CSI ISR latency.
 
 ### Revised six-step order
@@ -677,23 +694,38 @@ stress test surfaces anything unexpected.
 
 ---
 
-## Stop point
+## Resolved questions (preserved for context)
 
-Per task2_instructions.md §"Process": **stopping here for review**. Will not
-proceed to Task 3 until you OK the design.
+The questions originally listed under "Stop point" at task-2 review time
+are now resolved. Recording the outcomes here so the doc is internally
+consistent and reviewers don't re-debate decisions:
 
-Specific questions for review:
+1. **Option A vs Option B** — Option B (continuous CSI ping-pong DMA +
+   PIT-driven cadence). Decided after RISK1_FINDINGS.md showed the
+   GenX320's CPI packet timing floors the sensor frame rate at ~4 ms,
+   making Option A's "sensor-driven 1 ms cadence" unreachable. Validated
+   on hardware: see RISK1_FINDINGS.md continuous-mode results
+   (Hypothesis B confirmed, std/mean ~0.002 across heights).
+2. **FB1/FB2 ping-pong size** — h=6 lines (6 KB each). Originally
+   considered h=4 / h=8; h=6 is the saccade-latency-margin vs
+   pixel/wire-efficiency compromise per RISK1_FINDINGS.md §7a.
+3. **Packet header size** — 20 bytes. Originally 16 bytes per the
+   task-2 strawman; expanded to add `flags` (1 bit used for TRUNCATED,
+   rest reserved) plus alignment padding. Overhead negligible at
+   1 kHz × 16 KB packets.
+4. **`max_events_per_window` ceiling** — 4096 events. Backed by a
+   32 KB ring (DRAM via fb_alloc per §3a, not DTCM as originally
+   sketched).
+5. **USB short-write behavior** — drop the packet, set
+   `EVT_FLAG_USB_RETRY` on the *next* window's header. Drop is preferred
+   over retry-with-stale-data so cadence is preserved; `sequence` field
+   lets the Jetson detect the gap independently of the flag.
+6. **Memory placement** — DRAM-via-`fb_alloc` for ring + TX bufs +
+   FB1/FB2 + state-struct-in-DTCM. Per §3a after readelf measurement
+   showed DTCM has only 1.4 KB free.
 
-1. Is **Option B with the 4 KB FB1/FB2 ping-pong** the right call, or do you
-   want me to prototype Option A with shrunken CPI packet sizing first to
-   measure what the sensor actually does? (Option B is more code but
-   more predictable; Option A gives a measurement before committing.)
-2. Are you OK with the **20-byte header** (added 4 bytes for `flags` +
-   `reserved`) instead of the strawman 16-byte header from
-   task2_instructions.md? The added bytes are <0.025% overhead at full rate.
-3. **`max_events_per_window` ceiling of 4096** — backed by a 32 KB ring.
-   If you anticipate calibration bursts > 4096 events/ms regularly, the
-   ring should be larger. 8192 is still fine for DTCM (64 KB total).
-4. The decision to **drop packets on USB short-write** (vs. retry with
-   stale data) — this trades a hole in the data for cadence
-   preservation. Confirm that's what you want.
+## Status
+
+Design approved (task3_instructions.md confirmation). Implementation
+proceeds per §11a's revised six-step order, one step per commit, with
+review pauses at the points called out in §11a.
