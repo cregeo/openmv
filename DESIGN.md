@@ -694,6 +694,39 @@ stress test surfaces anything unexpected.
 
 ---
 
+## 11b. Known Issue: Rapid Start/Stop Cycle Limitation (v1)
+
+Repeated start/stop cycles with active streaming time between them can fail
+unpredictably after 2-3 iterations, with the third or later
+`evtstream.stop()` causing USB disconnect requiring physical replug.
+
+**Reproducer:** start, sleep >= 200ms, stop, repeat. Fails at cycle 3 or later.
+
+**Workarounds for v1:**
+- For production use, do NOT loop start/stop. Call start once at boot,
+  call stop only at shutdown.
+- If repeated streaming sessions are required, insert at least 1 second
+  of delay between stop() and the next start() to allow USB / CSI /
+  sensor state to fully settle.
+
+**Investigation status:** Multiple fixes attempted in v1 (sensor hard-reset,
+50ms settle, full CSI peripheral re-init via `imx_csi_config(csi,
+OMV_CSI_CONFIG_INIT)`). Each addresses one layer of state accumulation but
+the bug shifts rather than resolves. Root cause is suspected to be a
+combination of:
+- RT1062 CSI peripheral DMA descriptor state
+- TinyUSB CDC FIFO state during teardown
+- Sensor I/O state on rapid mode-switch
+
+Likely a deferred-IRQ or pending-DMA-completion race that requires
+synchronization point we haven't identified.
+
+**Deferred to v2:** Resolution requires deeper investigation into MCU/USB
+interaction during streaming teardown. Not blocking v1 production use
+since real-world eye-tracking does not loop start/stop.
+
+---
+
 ## Resolved questions (preserved for context)
 
 The questions originally listed under "Stop point" at task-2 review time
