@@ -631,5 +631,25 @@ void imx_csi_streaming_stop(omv_csi_t *csi) {
     omv_csi_streaming_cb = NULL;
     omv_csi_streaming_arg = NULL;
     omv_csi_streaming_fb_size_bytes = 0;
+
+    // Full peripheral software reset + base config rebuild. omv_csi_abort
+    // clears the CSI's user-visible enables (CR3 DMA_REQ_EN, CR18
+    // CSI_ENABLE) and the NVIC pending bit, but the CSI peripheral has
+    // additional internal state (RX FIFO contents, DMA descriptor
+    // machine, SOF / EOF detection, sync logic) that long continuous-
+    // mode streaming churns. After ~600 ms of cumulative streaming
+    // (e.g. two 300 ms start/stop cycles) the third start() catches the
+    // peripheral with stale state that hangs the next sensor I2C
+    // transaction long enough to trip the M7 watchdog -- USB OTG drops,
+    // physical replug needed. Reproduced deterministically in step-6
+    // verification's 5-cycle loop with sleep(0.3) per cycle.
+    //
+    // imx_csi_config(csi, OMV_CSI_CONFIG_INIT) does CSI_Reset(CSI) (the
+    // NXP HAL software-reset) plus rebuilds CR1/CR2/CR3 with the same
+    // base settings the boot-time omv_csi_init path established. The
+    // sensor polarity fields (csi->vsync_pol etc) are not touched by
+    // omv_csi_reset, so the polarity-dependent CR1 setup re-runs with
+    // the correct values for whatever sensor is attached.
+    imx_csi_config(csi, OMV_CSI_CONFIG_INIT);
 }
 #endif // MICROPY_PY_CSI
