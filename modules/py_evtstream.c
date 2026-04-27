@@ -724,7 +724,7 @@ static mp_obj_t py_evtstream_bench_csi(size_t n_args, const mp_obj_t *pos_args, 
     omv_csi_t *csi = omv_csi_get(-1);
     if (csi == NULL) {
         mp_raise_msg(&mp_type_OSError,
-                     MP_ERROR_TEXT("no CSI configured — call csi.CSI(cid=csi.GENX320) first"));
+                     MP_ERROR_TEXT("no CSI configured -- call csi.CSI(cid=csi.GENX320) first"));
     }
     if (csi->chip_id != GENX320_ID_ES && csi->chip_id != GENX320_ID_MP) {
         mp_raise_msg(&mp_type_OSError,
