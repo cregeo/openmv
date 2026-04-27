@@ -236,11 +236,26 @@ void omv_csi_line_callback(omv_csi_t *csi, uint32_t addr) {
     if (omv_csi_streaming_active) {
         if (omv_csi_streaming_cb != NULL) {
             #ifdef __DCACHE_PRESENT
-            // CSI DMA writes go straight to physical memory; if the FB lives
-            // in a cacheable region (e.g. DRAM via fb_alloc), the CPU may
-            // see stale cache lines. Invalidate before handing off.
+            // CSI DMA writes go straight to physical memory; if the FB
+            // lives in a cacheable region (e.g. DRAM via fb_alloc), the
+            // CPU may see stale cache lines. Invalidate before handing
+            // off, with explicit barriers around the SCB call:
+            //   * __DSB() before — drain any in-flight CPU stores so they
+            //     don't race the invalidate (defensive — none expected
+            //     here, but step 3a's bench_cache discovered that this
+            //     barrier matters even when in-theory unnecessary).
+            //   * __DSB(); __ISB(); after — ensure invalidate completes
+            //     and pipeline is flushed of any speculatively-fetched
+            //     stale-cache reads before the user callback runs.
+            // CMSIS's SCB_InvalidateDCache_by_Addr inlines the same
+            // barriers internally; doubling them is harmless, makes the
+            // ordering self-documenting, and forecloses any compiler-
+            // reordering hypothesis across the inline boundary.
+            __DSB();
             SCB_InvalidateDCache_by_Addr((uint32_t *) addr,
                                          omv_csi_streaming_fb_size_bytes);
+            __DSB();
+            __ISB();
             #endif
             omv_csi_streaming_cb((uint8_t *) addr, omv_csi_streaming_arg);
         }

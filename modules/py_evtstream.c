@@ -241,6 +241,17 @@ static void bench_build_and_ship(uint8_t *buf,
 // or invalidate is broken, returns stale cache), the read-back differs
 // from A and we count the window as a mismatch.
 //
+// Memory ordering: CMSIS's SCB_*DCache_by_Addr already includes
+// __DSB() at start and __DSB(); __ISB(); at end. We add explicit C-
+// level barriers around them anyway — both as belt-and-suspenders
+// against any compiler reordering across the inline boundary, and to
+// make the ordering self-documenting at the call site. The first
+// hardware run of step 3a returned 5-8% intermittent mismatches which
+// disappeared once these were added; whether the cause was a real
+// missing barrier or buffer misalignment (mock_fb was originally
+// 4-byte aligned via FB_ALLOC_NO_HINT), the fix is both: now
+// FB_ALLOC_CACHE_ALIGN'd at allocation AND explicitly fenced here.
+//
 // This is the testable direction (read after invalidate). The TX
 // direction (clean before USB DMA) is best-effort here per DESIGN.md
 // §11a — real verification is at step 5 integration when USB EHCI DMA
@@ -258,7 +269,9 @@ static void bench_cache_iterate(void) {
         buf[i] = a_seed + i;
     }
 
+    __DSB();  // ensure all pattern-A stores are visible to the cache controller
     SCB_CleanDCache_by_Addr((uint32_t *) buf, (int32_t) (n * sizeof(uint32_t)));
+    __DSB();  // wait for clean writebacks to reach DRAM
 
     // Pattern B over the same buffer. Now in cache (modified); DRAM
     // still holds pattern A from the clean above.
@@ -267,7 +280,11 @@ static void bench_cache_iterate(void) {
         buf[i] = b_seed + i;
     }
 
+    __DSB();  // ensure pattern-B stores are visible BEFORE we invalidate
     SCB_InvalidateDCache_by_Addr((uint32_t *) buf, (int32_t) (n * sizeof(uint32_t)));
+    __DSB();  // wait for invalidate ops to complete
+    __ISB();  // flush pipeline so any speculatively-prefetched stale data
+              // is discarded before the read-back
 
     // Read back. `volatile` defeats compiler caching of register values
     // from the pattern-B write loop above; without it the compiler is
@@ -542,13 +559,26 @@ static mp_obj_t py_evtstream_bench_cache(size_t n_args, const mp_obj_t *pos_args
 
     // Production buffer sizes per DESIGN.md §3a final placement table.
     // fb_alloc / fb_free are LIFO — stop() frees in reverse order.
+    //
+    // mock_fb uses FB_ALLOC_CACHE_ALIGN so its base address is
+    // OMV_CACHE_LINE_SIZE-aligned (32 bytes on M7). Without this,
+    // fb_alloc only guarantees 4-byte alignment and the SCB_*DCache_by_Addr
+    // calls would extend operations to the cache lines containing the
+    // unaligned start/end of mock_fb — which on this allocator share
+    // memory with the adjacent tx_b buffer. The first run of this test
+    // showed 5-8% intermittent mismatches before this hint was added.
+    //
+    // Size 6144 = 192 × 32 is already a clean multiple of the cache
+    // line, so no padding round-up needed. The other buffers use the
+    // default 4-byte alignment because step 3a doesn't exercise their
+    // cache patterns; production placement uses CACHE_ALIGN per §3a.
     const uint32_t ring_bytes  = 32u * 1024u;
     const uint32_t tx_bytes    = 16u * 1024u;
     const uint32_t mock_fb_bytes = 6u * 1024u;
     uint8_t *ring    = fb_alloc(ring_bytes, FB_ALLOC_NO_HINT);
     uint8_t *tx_a    = fb_alloc(tx_bytes, FB_ALLOC_NO_HINT);
     uint8_t *tx_b    = fb_alloc(tx_bytes, FB_ALLOC_NO_HINT);
-    uint8_t *mock_fb = fb_alloc(mock_fb_bytes, FB_ALLOC_NO_HINT);
+    uint8_t *mock_fb = fb_alloc(mock_fb_bytes, FB_ALLOC_CACHE_ALIGN);
 
     evtstream_state.window_us = (uint32_t) window_us;
     evtstream_state.bench_cache_ring   = ring;
