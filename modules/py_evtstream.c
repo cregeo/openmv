@@ -145,6 +145,16 @@ _Static_assert((EVTSTREAM_RING_CAP & EVTSTREAM_RING_MASK) == 0,
 // Truncation flag in the packet header's flags field.
 #define EVT_FLAG_TRUNCATED          (1u << 0)
 
+// Post-hard-reset settle delay (ms) before the next I2C transaction is
+// issued to the GenX320. Empirical value -- the GenX320 datasheet /
+// Prophesee headers don't expose a documented post-reset wait time, but
+// without this the second iteration of a tight start/stop loop catches
+// the sensor mid-settle and the next SET_MODE I2C transaction stalls
+// long enough to trip the M7 watchdog (USB OTG drops, physical replug
+// required). 50 ms is conservative for this class of CMOS event sensor;
+// tighten if a specific number lands from Prophesee.
+#define EVTSTREAM_RESET_SETTLE_MS   (50)
+
 // NVIC priority for the PIT IRQ. Lower = higher priority on Cortex-M.
 // Existing assignments on this port (lib/micropython/ports/mimxrt/irq.h):
 //   SysTick = 0, CSI = 3, USB OTG_HS = 6, EXTINT = 14.
@@ -1155,6 +1165,7 @@ static mp_obj_t py_evtstream_stop(void) {
         fb_free();  // fb1
         if (csi != NULL) {
             omv_csi_reset(csi, true);
+            mp_hal_delay_ms(EVTSTREAM_RESET_SETTLE_MS);
         }
     } else if (evtstream_state.stream_mode) {
         // Production teardown. PIT is already disarmed above; stop CSI
@@ -1184,6 +1195,12 @@ static mp_obj_t py_evtstream_stop(void) {
         // py_csi_reset's EBUSY hook (which only fires on the Python
         // wrapper layer). Safe to call here even with the running flag
         // still set.
+        //
+        // Followed by EVTSTREAM_RESET_SETTLE_MS so the GenX320 finishes
+        // its internal post-reset init before the caller's next I2C
+        // transaction. Without this, repeated start/stop cycles fail
+        // every ~3 iterations with USB disconnect (caught in step-6
+        // verification's 5-cycle loop test).
         omv_csi_t *csi = omv_csi_get(-1);
         if (csi != NULL) {
             imx_csi_streaming_stop(csi);
@@ -1202,6 +1219,7 @@ static mp_obj_t py_evtstream_stop(void) {
         fb_free();  // ring
         if (csi != NULL) {
             omv_csi_reset(csi, true);
+            mp_hal_delay_ms(EVTSTREAM_RESET_SETTLE_MS);
         }
     }
 
