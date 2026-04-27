@@ -454,7 +454,8 @@ evtstream.stop()
 ### `start(window_us, max_events_per_window)`
 
 - Validates: `100 <= window_us <= 10000`,
-  `64 <= max_events_per_window <= 4096`.
+  `64 <= max_events_per_window <= 512`. (Originally 4096; lowered to 512
+  after the step-3 CDC benchmark — see §3a-revision below.)
 - If already started: raises `OSError(EBUSY)`.
 - Saves the GenX320's current mode (`OMV_CSI_GENX320_MODE_HISTO` by
   default).
@@ -528,7 +529,7 @@ fine.
 | `stop()` called when not running | Internal flag | Return silently. |
 | Sensor mode was something exotic before `start()` | Read pre-call mode | Save and restore exactly what we read. Don't assume HISTO. |
 | Out-of-bounds args to `start()` | Range check at entry | `ValueError` with the offending field. |
-| `max_events_per_window` exceeds compile-time ring size | Range check | `ValueError` — ring is 4096 events, max accepted is 4096. |
+| `max_events_per_window` exceeds the validated FIFO ceiling | Range check | `ValueError` — accepted range is [64, 512] (see §7-revision). |
 | MicroPython GC sweep runs in the middle of a 1 ms window | N/A — heap not touched in hot path | No effect. Per §3a, ring + TX bufs + FBs are `fb_alloc()`'d from the framebuffer arena in DRAM (not the GC heap); state struct is a static in DTCM. None of these are visible to the MicroPython GC mark phase. |
 
 ---
@@ -547,17 +548,16 @@ fine.
    ~5 µs IRQ duration → 5% CPU. Acceptable. But if real peak is 50M
    evt/s during a calibration burst, this could grow. Verify with the
    existing `--save my_recording.csv` baseline and inspect peak rate.
-3. **USB CDC throughput at sustained 16 MB/s.** Tinyusb on RT1062 in
-   high-speed CDC mode should handle this, but `dmesg` on the Jetson
-   side and the existing CSV-streaming baseline (which already saturates
-   ~1 MB/s) are the only data points I have. If CDC stalls, fallback
-   plan is to drop `max_events_per_window` to 1024 (8 KB/ms = 8 MB/s).
-4. **`tud_cdc_write` behavior in IRQ context.** Tinyusb's documentation
-   says CDC class FIFO is IRQ-safe, but I want to verify by reading the
-   tinyusb source after submodules init. If it isn't, the PIT ISR has
-   to defer-to-thread (e.g. via PendSV). That changes the design but
-   not by much — the deferred handler is just a bounded thread-context
-   tail of what the ISR does today.
+3. ~~**USB CDC throughput at sustained 16 MB/s.**~~ **Resolved by
+   step-3 benchmark (2026-04-27)**: 99 % efficiency at packets up to
+   480 events (3860 bytes), 100 % drops at packets ≥ 4116 bytes —
+   sharp cliff at the 4 KB FIFO size. The `max_events_per_window`
+   ceiling was lowered to 512 to fit the validated FIFO size; see §7
+   `start()` revision and the resolved-questions block at the bottom.
+4. ~~**`tud_cdc_write` behavior in IRQ context.**~~ **Resolved**:
+   step-3 benchmark calls `tud_cdc_write` from the PIT ISR at 1 kHz
+   for 2 s × 6 sweep points without any crashes or stalls. Tinyusb
+   CDC FIFO is IRQ-safe in this configuration.
 5. **Effect on other CSI users while streaming is active.** While
    `evtstream.start()` is running, the existing GenX320 IOCTLs
    (`READ_EVENTS`, `CALIBRATE`) and other sensor scripts cannot use the
@@ -713,9 +713,21 @@ consistent and reviewers don't re-debate decisions:
    task-2 strawman; expanded to add `flags` (1 bit used for TRUNCATED,
    rest reserved) plus alignment padding. Overhead negligible at
    1 kHz × 16 KB packets.
-4. **`max_events_per_window` ceiling** — 4096 events. Backed by a
-   32 KB ring (DRAM via fb_alloc per §3a, not DTCM as originally
-   sketched).
+4. **`max_events_per_window` ceiling** — 512 events (revised 2026-04-27
+   from the original 4096 after the step-3 CDC throughput benchmark).
+   At 1 kHz cadence the tinyusb CDC TX FIFO at the existing
+   `CFG_TUD_CDC_TX_BUFSIZE = 4096` (in
+   `lib/micropython/ports/mimxrt/boards/OPENMV_RT1060/mpconfigboard.h`)
+   sustains 99 % efficiency for packets up to ~480 events (3860 bytes)
+   and drops 100 % at packets ≥ 4116 bytes. The eye-tracking saccade
+   peak rate is ~50–200 K events/s, i.e. ~50–200 events per 1 ms window
+   with worst-case bursts ~500. 512 fits cleanly inside the validated
+   FIFO ceiling without any board-config changes; if a future use case
+   needs higher per-window rates, bumping `CFG_TUD_CDC_TX_BUFSIZE` to
+   16 KB or 32 KB is a one-line change. The ring buffer was sized at
+   32 KB / 4096 events to give 2× headroom over the original 2048
+   max; with the new 512 ceiling that headroom is now 8×, comfortable
+   for blink bursts that overshoot the per-window cap.
 5. **USB short-write behavior** — drop the packet, set
    `EVT_FLAG_USB_RETRY` on the *next* window's header. Drop is preferred
    over retry-with-stale-data so cadence is preserved; `sequence` field
