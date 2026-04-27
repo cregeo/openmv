@@ -211,123 +211,104 @@ if cadence jitter exceeds budget.
 
 ---
 
-## 3a. DTCM budget — original §3 was wrong (added 2026-04-26)
+## 3a. Memory layout — measured (added 2026-04-26, revised 2026-04-27)
 
-The "~64 KB total ... plenty of headroom" claim in §3 was incorrect.
-Building the RISK1 follow-up validation patch with two 8 KB ping-pong FB
-buffers as DTCM-resident `static` arrays overflowed the region:
+The "~64 KB total ... plenty of headroom" claim in §3 was wrong twice over:
+once for assuming DTCM had room (it doesn't), and once for assuming OCRM1
+was a fallback (it isn't either). Both are full. The validation IOCTL
+overflowed DTCM by ~15 KB just trying to add two 8 KB static FBs.
 
-```
-region `DTCM' overflowed by 15552 bytes
-DTCM: 408768 B / 384 KB = 103.96%
-section `.dma.memory0' will not fit in region `DTCM'
-```
+### Measured allocations on a stock OPENMV_RT1060 build
 
-OpenMV already places a lot in DTCM by default on this board:
+`arm-none-eabi-readelf -S build/bin/firmware.elf`:
 
-- `OMV_GC_BLOCK1_MEMORY = DTCM`, `OMV_GC_BLOCK1_SIZE = 271K` — main GC heap
-- `OMV_DMA_MEMORY = DTCM` — misc DMA buffers (including `_line_buf` at
-  `OMV_LINE_BUF_SIZE = 11 K`)
-- BSS / data sections default to DTCM via `OMV_MAIN_MEMORY = DTCM`
-- Plus stack lives in ITCM1, but other ITCM2 / OCRAM allocations
-  intersect with FlexRAM partitioning
+**DTCM (393,216 B / 384 KB):**
 
-So most of the 384 KB DTCM is already spoken for. The §3 budget assumed
-a budget that doesn't exist.
+| Section          | Address      | Size       | Bytes    |
+|------------------|--------------|-----------:|---------:|
+| `.data`          | 0x20000000   | 0x600      | 1,536    |
+| `.bss`           | 0x20000800   | 0x17888    | 96,392   |
+| `.gc.block1`     | 0x20018088   | 0x43c00    | 277,504  |
+| `.dma.memory0`   | 0x2005bcc0   | 0x4000     | 16,384   |
+| **Used**         |              |            | **391,816** |
+| **Free**         |              |            | **1,400 B** |
 
-### Action item before Task 3 main implementation
+**OCRM1 (524,288 B / 512 KB):** entirely consumed by `.fb_overlay_storage`
+(0x80000 = 512 KB at 0x20200000).
 
-Run `arm-none-eabi-readelf -s build/bin/firmware.elf` (or
-`arm-none-eabi-size --format=sysv`) on a stock `OPENMV_RT1060` build
-without any evtstream changes, sum allocations in DTCM, and report
-actual free DTCM. Cregeo has the build environment; this can be done
-quickly when we get to Task 3 main. Until then the table below is
-provisional.
+**OCRM2 (65,536 B / 64 KB):** `.gc.block0` claims most of it.
 
-### Revised tentative placement (provisional pending readelf)
+So the previous §3a "three cases best/mid/worst" framing is moot. There
+isn't a meaningful amount of free TCM-or-OCRAM anywhere. The only viable
+"shave a region" candidate is `.gc.block1` at 277 KB (MicroPython's GC
+heap), which is user-visible (reduces Python heap ceiling).
 
-The hot-path latency budget tolerates DRAM-resident TX buffers — USB
-DMA reads from them, and the USB IRQ already handles cache coherency
-at packet-completion time. The ring buffer (written in CSI ISR, read
-in PIT ISR, both on the hot path) is more sensitive and should stay
-in DTCM if possible.
+### Pivot: everything-in-DRAM via fb_alloc, state struct in DTCM remainder
 
-Production buffer geometry uses the §7a-recommended **h=6 lines**, so
-each FB is 6 KB (down from the 8 KB used by the validation patch).
+DRAM is the only region with meaningful free space (~22 MB unallocated
+in `.fb_memory` at 0x80900000). All evtstream working buffers go there
+via `fb_alloc()`. The validation IOCTL already proves this works for
+CSI capture with cache invalidation in the ISR (commit 9ec4d5d) — extending
+to the rest of the buffers is a mechanical extension of the same pattern,
+not a new architectural decision.
 
-| Buffer | Old placement (§3) | New placement | Notes |
-|---|---|---|---|
-| Decoded event ring (32 KB) | DTCM | **DTCM** if free, else OCRM2 | Hot path, CSI-ISR-write / PIT-ISR-read; minimize cache traffic |
-| Packet TX buffer A (16404 B) | DTCM | **OCRM1 or DRAM** | USB EHCI DMA reads from any AXI-attached memory; cache-clean before submit |
-| Packet TX buffer B (16404 B) | DTCM | **OCRM1 or DRAM** | Same as A |
-| EVT2.0 raw FB1 (h=6 → 6 KB) | DTCM | **DRAM via fb_alloc** | Same approach as the validation patch (fb_alloc + cache-invalidate in IRQ) |
-| EVT2.0 raw FB2 (h=6 → 6 KB) | DTCM | **DRAM via fb_alloc** | Same |
-| State struct (~128 B) | DTCM | **DTCM** | Tiny; touch-frequency justifies DTCM |
+### Production memory placement — final
 
-### DTCM budget — three cases (provisional pending readelf)
+Production buffer geometry uses the §7a-recommended **h=6 lines**, so each
+ping-pong FB is 6 KB.
 
-The placement above is one specific point in a continuum of trade-offs.
-Three useful reference points for the readelf decision:
+| Buffer | Size | Region | Allocation | Cache management |
+|--------|-----:|--------|------------|------------------|
+| Decoded event ring | 32 KB | DRAM | `fb_alloc()` at `start()` | `SCB_InvalidateDCache_by_Addr` after CSI-ISR appends; `SCB_CleanDCache_by_Addr` is unnecessary because PIT-ISR is read-only on the ring |
+| Packet TX buffer A | 16 KB | DRAM | `fb_alloc()` at `start()` | `SCB_CleanDCache_by_Addr` before USB submit (write direction) |
+| Packet TX buffer B | 16 KB | DRAM | `fb_alloc()` at `start()` | Same as A |
+| Raw FB1 (h=6) | 6 KB | DRAM | `fb_alloc()` at `start()` | `SCB_InvalidateDCache_by_Addr` in line-callback hook (already in port code from validation patch) |
+| Raw FB2 (h=6) | 6 KB | DRAM | `fb_alloc()` at `start()` | Same as FB1 |
+| evtstream state struct | 128 B | DTCM | static (fits in 1.4 KB free) | None — TCM is non-cacheable |
 
-| Case | Placement choice | DTCM addition |
-|---|---|---|
-| **Best (recommended)** | ring + state in DTCM; TX in OCRM1 or DRAM; FB in DRAM | ~32 KB |
-| **Mid** | ring + state + TX in DTCM; FB in DRAM | ~64 KB |
-| **Worst** | everything in DTCM (TX + FB included) | ~76 KB |
+Total DRAM: ~76 KB out of ~22 MB free in `.fb_memory`. Trivial.
+Total DTCM: 128 B out of 1.4 KB free. Comfortable.
 
-Worst-case math: 32 KB ring + 16 KB TX-A + 16 KB TX-B + 6 KB FB1 + 6 KB
-FB2 + 0.128 KB state ≈ 76 KB. (My earlier "~32 KB" claim was best-case
-only and missed the TX bufs that the §3 budget had assumed sat in DTCM
-for latency reasons — the moved-to-OCRAM rationale needs to hold up
-under measurement before we lock in best-case.)
+### Cache management — concrete patterns
 
-**Worst-case 76 KB is meaningfully bigger than DTCM probably has free**
-right now — the validation patch overflowed by ~15 KB just adding
-16 KB of DTCM-static FB. The pre-existing OpenMV data fills DTCM to
-within ~10 KB of capacity.
+- **Decoded event ring (DRAM):** CSI ISR walks the just-completed FB and
+  appends decoded events to the ring. PIT ISR drains the ring into a TX
+  packet. Both ISRs run on the M7 with D-cache enabled. Two correctness
+  rules:
+  1. *After CSI ISR writes:* `SCB_CleanDCache_by_Addr(ring_chunk, size)`
+     so the lines are pushed to DRAM. (Necessary only if a different bus
+     master could read them — for our case, the PIT ISR is also on the
+     M7, so cache coherency holds without an explicit clean. Document
+     the assumption.)
+  2. *Before PIT ISR reads:* No invalidate needed when both writer and
+     reader are the same M7 — the cache is coherent with itself. If we
+     ever moved drain to a DMA engine, this would change.
+- **TX buffers (DRAM):** PIT ISR fills, then calls
+  `SCB_CleanDCache_by_Addr(buf, used_bytes)` to push CPU writes to
+  physical memory before handing the buffer to USB EHCI DMA. Identical
+  pattern to OpenMV's existing `framebuffer.c:223` (read-direction
+  invalidate); we apply the write-direction analogue.
+- **Raw FB1/FB2 (DRAM):** Already implemented in
+  `omv_csi_line_callback`'s streaming branch (commit 9ec4d5d).
+  `SCB_InvalidateDCache_by_Addr(addr, fb_size_bytes)` runs before
+  the user callback gets the buffer.
 
-This is why the readelf measurement can't be deferred. Without it we
-don't know which of the three cases is actually achievable. Possible
-outcomes:
+### What this costs in latency
 
-- **≥ 32 KB free DTCM**: best case is on the table. Production design
-  uses ring+state in DTCM, TX in OCRM1, FB in DRAM. ~0.7% CPU overhead
-  for cache management on TX/FB stays.
-- **< 32 KB but ≥ ~10 KB free DTCM**: ring has to move to OCRM2
-  (64 KB region). Latency probe needed: ring CSI-ISR-write +
-  PIT-ISR-read pattern, in cached OCRM2, with DCache invalidation per
-  access. Likely fine but should be measured.
-- **< ~10 KB free DTCM**: shave the GC heap. `OMV_GC_BLOCK1_SIZE` is
-  271 KB; reducing by 32 KB to make room for the ring is a viable
-  path but visible to users (smaller MicroPython heap). Document the
-  trade-off in the eventual STATUS.md.
+See §7a's amended worked numbers for the full breakdown. Short version:
+cache invalidation/clean of a 6 KB FB is ~96 cache-lines × ~30 cycles ≈
+5 µs at 600 MHz. Per-IRQ overhead is negligible relative to the 1 ms PIT
+window or the 5 ms saccade budget.
 
-### Cache management for non-DTCM buffers
+### Alternative considered: shave `.gc.block1`
 
-- **TX buffers in OCRM1/DRAM**: PIT ISR fills the buffer, calls
-  `SCB_CleanDCache_by_Addr(buf, size)` to push CPU writes to physical
-  memory, then submits to USB. USB DMA reads from physical memory; no
-  cache aliasing. Already a well-trodden pattern in OpenMV
-  (`framebuffer.c:223` for the read direction).
-- **FB1/FB2 in DRAM via fb_alloc**: CSI ISR receives the just-completed
-  FB; the port-side line-callback hook calls
-  `SCB_InvalidateDCache_by_Addr(addr, size)` before handing to the
-  user callback. The validation patch already does this — same code
-  path will be used in production.
-
-### Why this matters now and not later
-
-If the DTCM budget had been correct in §3, the Task 3 implementation
-would proceed as planned. Since it isn't, we either (a) shave the GC
-heap (user-visible — affects how big a program can run), (b) move
-buffers to OCRM/DRAM (this section's recommendation, performance
-impact small), or (c) split the difference. Each option has different
-implications for the implementation. Surfacing this now — before any
-main-module code is written — keeps the budget revision scoped.
-
-The "Three cases" table above operationalises the readelf branches.
-Each case has a concrete production-design implication; we pick the
-applicable case once we have the measurement in hand.
+The MicroPython GC heap at 277 KB could be reduced by 32 KB (changing
+`OMV_GC_BLOCK1_SIZE` from `271K` to `239K`) to make room for the
+decoded event ring in DTCM. This would lower L_cache by ~5 µs per
+FB-IRQ. Not worth doing for v1: the cache cost is already negligible,
+and shrinking the user-visible Python heap is a regression for users
+who don't care about evtstream. Reserve this option as a future
+optimisation if measurements show ring access is a bottleneck.
 
 ---
 
@@ -548,7 +529,7 @@ fine.
 | Sensor mode was something exotic before `start()` | Read pre-call mode | Save and restore exactly what we read. Don't assume HISTO. |
 | Out-of-bounds args to `start()` | Range check at entry | `ValueError` with the offending field. |
 | `max_events_per_window` exceeds compile-time ring size | Range check | `ValueError` — ring is 4096 events, max accepted is 4096. |
-| MicroPython GC sweep runs in the middle of a 1 ms window | N/A — heap not touched in hot path | No effect. Confirmed: ring, TX bufs, and state are all `static __attribute__((section("DTCM")))`. |
+| MicroPython GC sweep runs in the middle of a 1 ms window | N/A — heap not touched in hot path | No effect. Per §3a, ring + TX bufs + FBs are `fb_alloc()`'d from the framebuffer arena in DRAM (not the GC heap); state struct is a static in DTCM. None of these are visible to the MicroPython GC mark phase. |
 
 ---
 
@@ -625,6 +606,74 @@ For your reference; nothing written yet.
 
 No edits to `drivers/sensors/genx320.c`, `common/omv_csi.{c,h}`, or
 `ports/mimxrt/omv_csi.c`. The module is purely additive.
+
+(Caveat: the validation IOCTL series did add temporary code to
+`common/omv_csi.h`, `drivers/sensors/genx320.c`, `ports/mimxrt/omv_csi.c`,
+and `modules/py_csi_ng.c` — the streaming-hook variables, the line-callback
+short-circuit with cache invalidation, the IOCTL bindings, etc. The
+streaming-hook + cache invalidation infrastructure stays for production
+because the evtstream module reuses it. The DEBUG_CAPTURE / DEBUG_CAPTURE_CONTINUOUS
+IOCTLs themselves can be removed once the design is locked.)
+
+---
+
+## 11a. Implementation-order amendment for the DRAM-resident layout (added 2026-04-27)
+
+§3a's pivot to DRAM-via-fb_alloc for all working buffers introduces cache
+management as a first-class correctness concern. task3_instructions.md §8
+specifies a six-step implementation order; one extra step is needed
+**between synthetic CDC benchmark (step 3) and CSI integration (step 4)**:
+
+### New step 3a: cache-management stress test
+
+Before integrating the CSI capture path, verify the cache-management
+patterns end-to-end under sustained load. Write a self-contained test
+mode in `py_evtstream.c` (gated by a Python entry point, e.g.
+`evtstream.bench_cache()`) that:
+
+1. Allocates the four DRAM working buffers via `fb_alloc()` (one ring,
+   two TX bufs, one combined-FB1+FB2 mock) at the production sizes.
+2. From the PIT ISR, simulates the production write/read pattern:
+   - **Mock CSI ISR**: writes a counter pattern into a "FB" buffer in
+     DRAM, then `SCB_InvalidateDCache_by_Addr` (the production code
+     does the same in the line-callback streaming hook; here we just
+     test the round-trip).
+   - **Read back & verify**: a follow-up read inside the same IRQ
+     reads the buffer and checks the counter values match. If the cache
+     management is wrong, mismatches will show up here.
+   - **TX direction**: write a counter pattern into a TX buffer, call
+     `SCB_CleanDCache_by_Addr`, then read back via a `volatile` non-
+     cached alias of the same DRAM region (using a different MPU view,
+     or simply by reading after a pipeline flush) to verify the cache
+     was actually flushed.
+3. Runs at the production PIT rate (1 kHz) for 10 seconds.
+4. Reports counters via `stats()`: cache mismatches, sequence gaps,
+   SCB call counts, total bytes round-tripped.
+
+PASS criteria: zero cache mismatches over 10 seconds at 1 kHz cadence.
+
+This is cheap to write (few hundred lines), runs without sensor
+hardware, and decouples the cache-correctness verification from the
+CSI integration. If it passes, we know the cache pattern is solid
+before adding the CSI complexity. If it fails, we debug cache
+ordering in isolation rather than amid CSI ISR latency.
+
+### Revised six-step order
+
+| Step | Source | Status |
+|------|--------|--------|
+| 1. Skeleton (start/stats/stop flags only) | task3_instructions.md §8 step 1 | unchanged |
+| 2. PIT-only path | step 2 | unchanged |
+| 3. Synthetic CDC benchmark | step 3 (also covers task3_instructions §6) | unchanged |
+| **3a. Cache-management stress test** | **new** (this section) | **mandatory before step 4** |
+| 4. CSI integration | step 4 | unchanged |
+| 5. Full path | step 5 | unchanged |
+| 6. CSI exclusivity hook | step 6 | unchanged |
+| 7. Failure mode handling | step 7 | unchanged |
+
+Stop points stay where they were: after step 1 (skeleton), after step
+3 (CDC benchmark). Add a third optional stop after step 3a if the
+stress test surfaces anything unexpected.
 
 ---
 

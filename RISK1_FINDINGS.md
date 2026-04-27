@@ -255,9 +255,16 @@ landing in a Jetson packet is the sum of three terms:
 | Term              | Formula                                              | Bound        |
 |-------------------|------------------------------------------------------|--------------|
 | **DMA fill latency** `L_fill` | (FB_size_bytes / wire_byte_rate)        | per-FB time  |
+| **Cache management** `L_cache` | (~30 cycles/cache-line × n_lines / clk) | per IRQ      |
 | **PIT drain latency** `L_pit` | (≤ window_us = 1000 µs)                 | one window   |
 | **USB CDC latency** `L_usb`   | (host scheduling, ~1 ms typ., spike-prone) | ≈ 1–3 ms |
-| **Total**         | `L_fill + L_pit + L_usb`                              | sum          |
+| **Total**         | `L_fill + L_cache + L_pit + L_usb`                    | sum          |
+
+`L_cache` is the cost of `SCB_InvalidateDCache_by_Addr` over each FB after
+DMA completion (per DESIGN.md §3a — all working buffers live in DRAM).
+For h=6 (6 KB FB / 96 cache-lines on a 64-byte line) the hit is
+~96 × 30 / 600 MHz ≈ 4.8 µs. Negligible compared with the 1 ms PIT window.
+Same order of magnitude per-TX-buffer cache-clean before USB submit.
 
 `L_fill` is the dominant term. It is *not* the average decode interval
 (events arrive in the ring as soon as their FB completes); it is the
@@ -295,20 +302,24 @@ efficiency (measured at h=8 in the continuous-mode validation; h=6 sits
 between h=4 and h=8, expect 95-99%), pixel-event capacity per FB is
 ~1450-1520.
 
-| Scenario        | Pixel rate | Wire byte rate | `L_fill` | Total latency |
-|-----------------|-----------:|---------------:|---------:|--------------:|
-| Fixation        |    50K/s   |    ~280 KB/s   |  ~21 ms  |  ~23 ms (OK\*) |
-| Onset transition|    rising  |    rising      |  ≤2.1 ms |  ≤4.1 ms (OK) |
-| Saccade peak    |   500K/s   |    ~2.8 MB/s   |  ~2.1 ms |   ~4.1 ms (OK) |
-| Blink burst     |   1M/s+    |    ~5.6 MB/s+  |  ~1.1 ms |   ~3.1 ms (OK) |
+| Scenario        | Pixel rate | Wire byte rate | `L_fill` | `L_cache` | `L_pit` | `L_usb` | Total |
+|-----------------|-----------:|---------------:|---------:|----------:|--------:|--------:|------:|
+| Fixation        |    50K/s   |    ~280 KB/s   |  ~21 ms  |  ~5 µs    |  ≤1 ms  |  ~1 ms  |  ~23 ms (OK\*) |
+| Onset transition|    rising  |    rising      |  ≤2.1 ms |  ~5 µs    |  ≤1 ms  |  ~1 ms  |  ≤4.1 ms (OK) |
+| Saccade peak    |   500K/s   |    ~2.8 MB/s   |  ~2.1 ms |  ~5 µs    |  ≤1 ms  |  ~1 ms  |  ~4.1 ms (OK) |
+| Blink burst     |   1M/s+    |    ~5.6 MB/s+  |  ~1.1 ms |  ~5 µs    |  ≤1 ms  |  ~1 ms  |  ~3.1 ms (OK) |
 
 \* Fixation row exceeds the 5 ms budget by design — at fixation the NIR
 ground truth carries the tracker, so event latency is irrelevant. See
 saccade-vs-fixation framing above.
 
 Saccade row total ≈ 4.1 ms, leaving ~0.86 ms of slack inside the 5 ms
-budget. Tight but adequate. If measured `L_usb` turns out lower than the
-1 ms estimate, the slack grows accordingly.
+budget. Tight but adequate. `L_cache` of ~5 µs per IRQ doesn't move the
+needle vs the millisecond-scale terms — DRAM-resident buffers (per the
+post-readelf §3a pivot) cost almost nothing in practice.
+
+If measured `L_usb` turns out lower than the 1 ms estimate, the slack
+grows accordingly.
 
 ### Why h=6, not h=4 or h=8?
 
