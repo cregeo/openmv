@@ -25,25 +25,32 @@
  *
  * evtstream — fixed-cadence event streaming for GenX320 on OpenMV RT1062.
  *
- * STEP 4: CSI integration (decode-and-discard). `evtstream.bench_csi()`
- * configures the GenX320 in continuous ping-pong DMA at h=6 lines (the
- * production geometry per DESIGN.md §3a / §7a) and registers a CSI-IRQ
- * decoder that walks EVT2.0 words and counts pixel events into
- * `events_decoded` / `last_fb_pixel_count`. No ring buffer or USB
- * shipping yet — that's step 5. Sensor must be initialised in EVENT
- * mode by the caller (csi.CSI(cid=csi.GENX320) +
- * csi.IOCTL_GENX320_SET_MODE) before bench_csi(). The PIT timer keeps
- * running as a passive heartbeat (last_window_us / windows_sent stay
- * live) but doesn't drive any data work in this step.
+ * STEP 5: full path. Production `evtstream.start()` brings up the whole
+ * pipeline: CSI in continuous ping-pong DMA at h=6, CSI ISR decodes
+ * EVT2.0 -> SPSC event ring (32 KB DRAM, 4096 entries), PIT at
+ * window_us cadence drains the ring into a 20-byte-header + N-event
+ * packet and ships via tinyusb CDC. Heartbeat packets every window
+ * (event_count=0 if ring empty). Truncation flag if more events
+ * available than max_events_per_window. csi_dma_underruns counts
+ * windows with no CSI activity since the previous drain.
+ *
+ * Memory placement per DESIGN.md §3a (DRAM-resident, fb_alloc'd at
+ * start, freed at stop):
+ *   ring   32 KB  CSI-write / PIT-read; M7-only access, no cross-master
+ *                  cache concern (writer + reader same core)
+ *   tx_a   16 KB  PIT-fill / tinyusb-read (memcpy through cache; no
+ *   tx_b   16 KB     SCB clean needed -- see step 3 commit d783b72)
+ *   fb1     6 KB  CSI DMA -> CPU read; cache-invalidated in port-side
+ *   fb2     6 KB     line-callback hook (commit c86ad4f)
  *
  * Steps prior:
  *   1.  skeleton (start/stop/stats flags only)
  *   2.  PIT-only path
  *   3.  synthetic USB CDC throughput benchmark
  *   3a. cache-management stress test
+ *   4.  CSI integration (decode-and-discard)
  *
  * Subsequent steps add (per DESIGN.md §11a):
- *   5.  full path (PIT drains ring into CDC packets)
  *   6.  CSI exclusivity hook
  *   7.  failure mode handling
  */
@@ -122,6 +129,22 @@ typedef struct __attribute__((packed)) {
 _Static_assert(sizeof(evt_packet_header_t) == 20, "header must be 20 B");
 _Static_assert(sizeof(evt_wire_event_t)   == 8,  "wire event must be 8 B");
 
+// Production buffer sizing per DESIGN.md §3a final placement table.
+// All four sizes are powers of 2 so ring index masking is a single AND.
+#define EVTSTREAM_RING_BYTES        (32u * 1024u)
+#define EVTSTREAM_RING_CAP          (EVTSTREAM_RING_BYTES / sizeof(evt_wire_event_t))
+#define EVTSTREAM_RING_MASK         (EVTSTREAM_RING_CAP - 1u)
+#define EVTSTREAM_TX_BYTES          (16u * 1024u)
+#define EVTSTREAM_FB_HEIGHT_LINES   (6u)
+#define EVTSTREAM_DMA_LINE_BYTES    (1024u)
+#define EVTSTREAM_FB_BYTES          (EVTSTREAM_FB_HEIGHT_LINES * EVTSTREAM_DMA_LINE_BYTES)
+
+_Static_assert((EVTSTREAM_RING_CAP & EVTSTREAM_RING_MASK) == 0,
+               "ring capacity must be a power of 2");
+
+// Truncation flag in the packet header's flags field.
+#define EVT_FLAG_TRUNCATED          (1u << 0)
+
 // NVIC priority for the PIT IRQ. Lower = higher priority on Cortex-M.
 // Existing assignments on this port (lib/micropython/ports/mimxrt/irq.h):
 //   SysTick = 0, CSI = 3, USB OTG_HS = 6, EXTINT = 14.
@@ -185,6 +208,28 @@ static struct {
     uint8_t *bench_csi_fb2;
     uint32_t bench_csi_fb_size_bytes;
 
+    // Production stream mode (step 5). Same buffer set as bench_csi
+    // (FB1/FB2) plus the SPSC event ring (CSI ISR producer, PIT ISR
+    // consumer) and the two ping-pong TX packet buffers. Single-
+    // producer / single-consumer ring with monotonic 32-bit counters;
+    // index = head & EVTSTREAM_RING_MASK. uint32 wraps at ~4G writes
+    // (~71 min at 1 M evt/s) -- acceptable for v1, can move to
+    // uint64 if longer sessions are needed.
+    volatile bool stream_mode;
+    uint8_t *stream_ring;          // 32 KB
+    uint8_t *stream_tx_a;          // 16 KB
+    uint8_t *stream_tx_b;          // 16 KB
+    uint8_t *stream_fb1;           // 6 KB
+    uint8_t *stream_fb2;           // 6 KB
+    volatile uint32_t ring_head;   // CSI-write
+    volatile uint32_t ring_tail;   // PIT-write
+    volatile uint8_t  stream_cur_tx_buf_idx;
+    // csi_isrs_since_last_pit: incremented in CSI ISR, read-and-cleared
+    // by PIT ISR; if zero at PIT fire, csi_dma_underruns++ (per the
+    // task-3 step-5 spec). At idle this fires every PIT window (sensor
+    // genuinely produces no FBs); user interprets in context.
+    volatile uint32_t csi_isrs_since_last_pit;
+
     // Stats counters. windows_sent / sequence / last_window_us start being
     // touched in step 2; events_sent / usb_drops / last_window_event_count
     // start in step 3; cache_mismatches in step 3a; events_decoded /
@@ -196,8 +241,9 @@ static struct {
     volatile uint32_t cache_mismatches;
     volatile uint32_t events_decoded;
     volatile uint32_t last_fb_pixel_count;
-    uint32_t window_truncated_total;
-    uint32_t ring_lost_events_total;
+    volatile uint32_t events_dropped;       // ring overflow events (step 5)
+    volatile uint32_t last_ring_fill;       // high-water mark over the run
+    volatile uint32_t window_truncated_total;
     volatile uint32_t csi_dma_underruns;
     volatile uint32_t last_window_event_count;
     volatile uint32_t last_window_us;
@@ -299,6 +345,176 @@ static void bench_csi_decode_cb(uint8_t *fb_addr, void *arg) {
     }
     evtstream_state.events_decoded += pix;
     evtstream_state.last_fb_pixel_count = pix;
+}
+
+// Production CSI ISR decoder for step 5. Same context as
+// bench_csi_decode_cb but writes into the SPSC event ring instead of
+// counting-and-discarding.
+//
+// Timestamping: a single mp_hal_ticks_us() snapshot at FB-done is used
+// as the abs_ts for ALL events in this FB. Sub-FB temporal resolution
+// (events spanning ~2 ms within a saturated h=6 FB) is lost in step 5;
+// step 6/production-correctness can replace this with a sensor-clock
+// to MCU-clock mapping using the EVT2.0 EV_TIME_HIGH stream. The
+// stored t_us is abs_ts_low16; the PIT drainer converts to window-
+// relative t_us at pack time.
+//
+// Ring discipline: SPSC with monotonic 32-bit head/tail counters.
+// `head - tail` is current fill (uint32 modular subtraction is correct
+// across the 71-min wrap). Index = head & EVTSTREAM_RING_MASK. CSI is
+// the higher-priority IRQ on this port, so it can preempt PIT but not
+// vice-versa -- the producer side of the SPSC only needs a __DMB
+// before publishing the new head.
+static void stream_csi_decode_cb(uint8_t *fb_addr, void *arg) {
+    (void) arg;
+    evtstream_state.csi_isrs_since_last_pit++;
+
+    const uint32_t fb_ts_us = (uint32_t) mp_hal_ticks_us();
+    const uint16_t fb_ts_low16 = (uint16_t) fb_ts_us;
+    const uint32_t *words = (const uint32_t *) fb_addr;
+    const uint32_t n_words = EVTSTREAM_FB_BYTES / sizeof(uint32_t);
+    evt_wire_event_t *ring = (evt_wire_event_t *) evtstream_state.stream_ring;
+
+    uint32_t head = evtstream_state.ring_head;
+    const uint32_t tail = evtstream_state.ring_tail;
+    uint32_t dropped = 0;
+    uint32_t pix = 0;
+
+    for (uint32_t i = 0; i < n_words; i++) {
+        const uint32_t v = words[i];
+        const uint32_t type = __EVT20_TYPE(v);
+        if (type != TD_LOW && type != TD_HIGH) {
+            // EV_TIME_HIGH / EXT_TRIGGER / padding -- skipped in step 5.
+            // Step 6/production may track EV_TIME_HIGH for sensor-clock
+            // mapping; EXT_TRIGGER is deferred per DESIGN.md §5.
+            continue;
+        }
+
+        if ((head - tail) >= EVTSTREAM_RING_CAP) {
+            // Ring full -- drop event, count it, but keep walking the FB
+            // so we don't leave decoded EV_TIME_HIGH state stale.
+            dropped++;
+            continue;
+        }
+
+        const uint32_t x = __EVT20_X(v);
+        const uint32_t y = __EVT20_Y(v);
+        if (x >= 320 || y >= 320) {
+            // Coordinate sanity check; keep counting in pix to make the
+            // decoded-vs-dropped balance consistent, but skip the ring
+            // write so Jetson never sees out-of-range coords.
+            continue;
+        }
+
+        evt_wire_event_t *slot = &ring[head & EVTSTREAM_RING_MASK];
+        slot->t_us = fb_ts_low16;
+        slot->x = (uint16_t) x;
+        slot->y = (uint16_t) y;
+        slot->polarity = (uint8_t) (type & 1u);  // TD_LOW=0=OFF, TD_HIGH=1=ON
+        slot->flags = 0;
+        head++;
+        pix++;
+    }
+
+    evtstream_state.events_decoded += pix;
+    evtstream_state.last_fb_pixel_count = pix;
+    if (dropped > 0) {
+        evtstream_state.events_dropped += dropped;
+    }
+    __DMB();
+    evtstream_state.ring_head = head;  // single 32-bit publish
+}
+
+// Production PIT drain helper for step 5. Runs in PIT IRQ context.
+// Drains up to max_events_per_window from the ring into the next
+// ping-pong TX buffer, packs the production header + payload, and
+// hands the buffer to tinyusb CDC with the same atomic-or-skip
+// semantics as bench(): if the FIFO can't hold the whole packet,
+// drop and count usb_drops -- never partial writes.
+//
+// Heartbeat: even if the ring is empty, we still ship a header-only
+// packet (event_count = 0) so the Jetson sees a steady cadence and
+// can distinguish "static scene" from "USB stalled".
+//
+// CSI underrun: if no CSI ISR has fired since the previous PIT drain,
+// csi_dma_underruns++. At idle this fires every PIT window (sensor
+// genuinely produces no FBs); user reads the metric in context.
+static void stream_pit_drain_and_ship(uint32_t window_start_us, uint32_t sequence) {
+    // Pick the inactive ping-pong TX buffer (ping-pong on each PIT
+    // fire so the previous window's packet, possibly still draining
+    // through tinyusb's FIFO, doesn't get clobbered by this fill).
+    uint8_t *buf = (evtstream_state.stream_cur_tx_buf_idx == 0)
+                   ? evtstream_state.stream_tx_a
+                   : evtstream_state.stream_tx_b;
+    evtstream_state.stream_cur_tx_buf_idx ^= 1;
+
+    // CSI underrun bookkeeping: read-and-clear the per-PIT-window CSI
+    // activity counter.
+    if (evtstream_state.csi_isrs_since_last_pit == 0) {
+        evtstream_state.csi_dma_underruns++;
+    }
+    evtstream_state.csi_isrs_since_last_pit = 0;
+
+    // Drain plan: snapshot ring head once (CSI is higher priority and
+    // may have preempted us right before this read; that's fine, we
+    // just see a stale-but-consistent snapshot).
+    const uint32_t head = evtstream_state.ring_head;
+    const uint32_t tail = evtstream_state.ring_tail;
+    const uint32_t available = head - tail;
+    const uint32_t max = evtstream_state.max_events_per_window;
+    const uint32_t n_drain = (available > max) ? max : available;
+    const bool truncated = (available > max);
+
+    if (available > evtstream_state.last_ring_fill) {
+        evtstream_state.last_ring_fill = available;
+    }
+
+    // Build header.
+    evt_packet_header_t *hdr = (evt_packet_header_t *) buf;
+    hdr->magic = EVT_PACKET_MAGIC;
+    hdr->window_start_us = window_start_us;
+    hdr->window_duration_us = (uint16_t) evtstream_state.window_us;
+    hdr->event_count = (uint16_t) n_drain;
+    hdr->flags = truncated ? EVT_FLAG_TRUNCATED : 0;
+    hdr->reserved = 0;
+    hdr->sequence = sequence;
+
+    // Pack payload, converting ring's abs_ts_low16 into window-relative
+    // t_us via modular subtraction. Modular wrap of uint16 is harmless
+    // for events in the current window (delta < window_us << 65536).
+    const uint16_t window_low16 = (uint16_t) window_start_us;
+    const evt_wire_event_t *ring = (const evt_wire_event_t *) evtstream_state.stream_ring;
+    evt_wire_event_t *out = (evt_wire_event_t *) (buf + sizeof(*hdr));
+    for (uint32_t i = 0; i < n_drain; i++) {
+        const evt_wire_event_t *src = &ring[(tail + i) & EVTSTREAM_RING_MASK];
+        out[i].t_us = (uint16_t)(src->t_us - window_low16);
+        out[i].x = src->x;
+        out[i].y = src->y;
+        out[i].polarity = src->polarity;
+        out[i].flags = src->flags;
+    }
+
+    __DMB();
+    evtstream_state.ring_tail = tail + n_drain;  // single 32-bit publish
+
+    if (truncated) {
+        evtstream_state.window_truncated_total++;
+    }
+
+    // Atomic-or-skip USB submit (DESIGN.md §5).
+    const uint32_t pkt_size = sizeof(evt_packet_header_t)
+                            + n_drain * sizeof(evt_wire_event_t);
+    if (tud_cdc_write_available() < pkt_size) {
+        evtstream_state.usb_drops++;
+        return;
+    }
+    if (tud_cdc_write(buf, pkt_size) != pkt_size) {
+        evtstream_state.usb_drops++;
+        return;
+    }
+    tud_cdc_write_flush();
+    evtstream_state.events_sent += n_drain;
+    evtstream_state.last_window_event_count = n_drain;
 }
 
 // Run one window's worth of the cache-management stress test (step 3a).
@@ -406,6 +622,8 @@ void PIT_IRQHandler(void) {
             bench_build_and_ship(buf, now, evtstream_state.sequence);
         } else if (evtstream_state.bench_cache_mode) {
             bench_cache_iterate();
+        } else if (evtstream_state.stream_mode) {
+            stream_pit_drain_and_ship(now, evtstream_state.sequence);
         }
     }
 
@@ -429,12 +647,18 @@ static void evtstream_reset_isr_counters(void) {
     evtstream_state.cache_mismatches = 0;
     evtstream_state.events_decoded = 0;
     evtstream_state.last_fb_pixel_count = 0;
+    evtstream_state.events_dropped = 0;
+    evtstream_state.last_ring_fill = 0;
+    evtstream_state.window_truncated_total = 0;
     evtstream_state.csi_dma_underruns = 0;
+    evtstream_state.csi_isrs_since_last_pit = 0;
     evtstream_state.last_window_event_count = 0;
     evtstream_state.sequence = 0;
     evtstream_state.last_window_us = 0;
     evtstream_state.prev_ticks_us = 0;
     evtstream_state.first_fire = true;
+    evtstream_state.ring_head = 0;
+    evtstream_state.ring_tail = 0;
 }
 
 // Configures and starts PIT at `window_us` cadence. Returns 0 on success
@@ -483,17 +707,32 @@ static void evtstream_disarm_pit(void) {
 
 // Public API ------------------------------------------------------------
 
-// evtstream.start(window_us=1000, max_events_per_window=2048)
+// evtstream.start(window_us=1000, max_events_per_window=480)
 //
-// Validates args, takes EBUSY if already running, then configures and
-// starts PIT channel 0 at the requested cadence. Step 2: just the timer;
-// CSI / USB are wired in later steps. Step 3 keeps start() data-path-free
-// — `bench()` is the synthetic-TX entry point.
+// Production entry point. Allocates the four DRAM working buffers
+// (DESIGN.md §3a), configures the GenX320 already-set-up-by-caller in
+// continuous ping-pong DMA at h=6, and arms PIT at window_us cadence.
+// CSI ISR decodes EVT2.0 events into the SPSC ring; PIT ISR drains the
+// ring into a wire-format packet and ships via tinyusb CDC.
+//
+// The default max_events_per_window=480 leaves comfortable margin
+// inside the 4 KB CDC TX FIFO (480*8 + 20 = 3860 bytes). Up to 512 is
+// allowed per DESIGN.md §7's revised ceiling, but at the FIFO cliff
+// (4116 bytes for 512 events) usb_drops will be near 100% under load.
+//
+// Caller must initialise the GenX320 in EVENT mode beforehand:
+//
+//     csi0 = csi.CSI(cid=csi.GENX320)
+//     csi0.reset()
+//     csi0.ioctl(csi.IOCTL_GENX320_SET_MODE, csi.GENX320_MODE_EVENT, 4096)
+//     evtstream.start(window_us=1000)
+//     time.sleep(N)
+//     evtstream.stop()
 static mp_obj_t py_evtstream_start(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum { ARG_window_us, ARG_max_events_per_window };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_window_us,             MP_ARG_INT, {.u_int = 1000} },
-        { MP_QSTR_max_events_per_window, MP_ARG_INT, {.u_int = 2048} },
+        { MP_QSTR_max_events_per_window, MP_ARG_INT, {.u_int = 480} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all(n_args, pos_args, kw_args,
@@ -502,24 +741,74 @@ static mp_obj_t py_evtstream_start(size_t n_args, const mp_obj_t *pos_args, mp_m
     int window_us = args[ARG_window_us].u_int;
     int max_events = args[ARG_max_events_per_window].u_int;
 
+    // Range checks per DESIGN.md §7 (revised after step-3 results).
     if (window_us < 100 || window_us > 10000) {
         mp_raise_ValueError(MP_ERROR_TEXT("window_us must be in [100, 10000]"));
     }
-    if (max_events < 64 || max_events > 4096) {
-        mp_raise_ValueError(MP_ERROR_TEXT("max_events_per_window must be in [64, 4096]"));
+    if (max_events < 64 || max_events > 512) {
+        mp_raise_ValueError(MP_ERROR_TEXT("max_events_per_window must be in [64, 512]"));
     }
     if (evtstream_state.running) {
         mp_raise_OSError(MP_EBUSY);
     }
 
+    omv_csi_t *csi = omv_csi_get(-1);
+    if (csi == NULL) {
+        mp_raise_msg(&mp_type_OSError,
+                     MP_ERROR_TEXT("no CSI configured -- call csi.CSI(cid=csi.GENX320) first"));
+    }
+    if (csi->chip_id != GENX320_ID_ES && csi->chip_id != GENX320_ID_MP) {
+        mp_raise_msg(&mp_type_OSError,
+                     MP_ERROR_TEXT("attached sensor is not a GenX320"));
+    }
+
+    // Allocate the production buffer set per DESIGN.md §3a final
+    // placement table. fb_alloc / fb_free are LIFO -- stop() frees in
+    // reverse order: fb2 -> fb1 -> tx_b -> tx_a -> ring.
+    //
+    // All buffers CACHE_ALIGNed (32-byte) per the step-3a finding;
+    // unaligned cache-managed buffers caused intermittent races.
+    uint8_t *ring = fb_alloc(EVTSTREAM_RING_BYTES, FB_ALLOC_CACHE_ALIGN);
+    uint8_t *tx_a = fb_alloc(EVTSTREAM_TX_BYTES,   FB_ALLOC_CACHE_ALIGN);
+    uint8_t *tx_b = fb_alloc(EVTSTREAM_TX_BYTES,   FB_ALLOC_CACHE_ALIGN);
+    uint8_t *fb1  = fb_alloc(EVTSTREAM_FB_BYTES,   FB_ALLOC_CACHE_ALIGN);
+    uint8_t *fb2  = fb_alloc(EVTSTREAM_FB_BYTES,   FB_ALLOC_CACHE_ALIGN);
+
     evtstream_state.window_us = (uint32_t) window_us;
     evtstream_state.max_events_per_window = (uint32_t) max_events;
+    evtstream_state.stream_ring = ring;
+    evtstream_state.stream_tx_a = tx_a;
+    evtstream_state.stream_tx_b = tx_b;
+    evtstream_state.stream_fb1 = fb1;
+    evtstream_state.stream_fb2 = fb2;
+    evtstream_state.stream_cur_tx_buf_idx = 0;
+
     evtstream_reset_isr_counters();
 
-    evtstream_state.running = true;  // see arm_pit comment about ordering
+    evtstream_state.running = true;
+    evtstream_state.stream_mode = true;
     __DSB();
-    if (evtstream_arm_pit((uint32_t) window_us) < 0) {
+
+    // Bring up CSI ping-pong DMA first; the decoder cb begins firing
+    // as soon as the first FB completes. Failure paths free buffers
+    // in reverse-allocation order.
+    int rc = imx_csi_streaming_start(csi, fb1, fb2,
+                                     (uint16_t) EVTSTREAM_DMA_LINE_BYTES,
+                                     (uint16_t) EVTSTREAM_FB_HEIGHT_LINES,
+                                     stream_csi_decode_cb, NULL);
+    if (rc != 0) {
+        evtstream_state.stream_mode = false;
         evtstream_state.running = false;
+        fb_free(); fb_free(); fb_free(); fb_free(); fb_free();
+        mp_raise_msg(&mp_type_OSError,
+                     MP_ERROR_TEXT("imx_csi_streaming_start failed"));
+    }
+
+    if (evtstream_arm_pit((uint32_t) window_us) < 0) {
+        imx_csi_streaming_stop(csi);
+        evtstream_state.stream_mode = false;
+        evtstream_state.running = false;
+        fb_free(); fb_free(); fb_free(); fb_free(); fb_free();
         mp_raise_ValueError(MP_ERROR_TEXT("PIT period out of range"));
     }
     return mp_const_none;
@@ -837,6 +1126,26 @@ static mp_obj_t py_evtstream_stop(void) {
         evtstream_state.bench_csi_fb_size_bytes = 0;
         fb_free();  // fb2
         fb_free();  // fb1
+    } else if (evtstream_state.stream_mode) {
+        // Production teardown. PIT is already disarmed above; stop CSI
+        // (no more events into ring), then free buffers in reverse-
+        // allocation order: fb2 -> fb1 -> tx_b -> tx_a -> ring.
+        omv_csi_t *csi = omv_csi_get(-1);
+        if (csi != NULL) {
+            imx_csi_streaming_stop(csi);
+        }
+        evtstream_state.stream_mode = false;
+        __DSB();
+        evtstream_state.stream_fb1 = NULL;
+        evtstream_state.stream_fb2 = NULL;
+        evtstream_state.stream_tx_a = NULL;
+        evtstream_state.stream_tx_b = NULL;
+        evtstream_state.stream_ring = NULL;
+        fb_free();  // fb2
+        fb_free();  // fb1
+        fb_free();  // tx_b
+        fb_free();  // tx_a
+        fb_free();  // ring
     }
 
     evtstream_state.running = false;
@@ -846,29 +1155,29 @@ static MP_DEFINE_CONST_FUN_OBJ_0(py_evtstream_stop_obj, py_evtstream_stop);
 
 // evtstream.stats()
 //
-// Returns a snapshot of the counter dict. After step 4:
+// Returns a snapshot of the counter dict. After step 5:
 //   - windows_sent, sequence, last_window_us — live in any mode (PIT-driven)
-//   - events_sent, usb_drops, last_window_event_count — live in bench mode
+//   - events_sent, usb_drops, last_window_event_count — live in bench
+//     mode and stream mode
 //   - cache_mismatches — live in bench_cache mode
 //   - events_decoded, last_fb_pixel_count — live in bench_csi mode
-//   - csi_dma_underruns — defined; not driven yet (no underrun signal in
-//     step 4's path), wired in step 5 when the ring-buffer drain pattern
-//     gives us a real "expected fire missing" signal
-//   - window_truncated_total, ring_lost_events_total — wired in step 5
+//   - events_dropped, last_ring_fill, csi_dma_underruns,
+//     window_truncated_total — live in stream mode
 static mp_obj_t py_evtstream_stats(void) {
-    mp_obj_t d = mp_obj_new_dict(12);
+    mp_obj_t d = mp_obj_new_dict(14);
     #define STORE(key, val) \
         mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_##key), mp_obj_new_int_from_uint(val))
     STORE(windows_sent,             evtstream_state.windows_sent);
     STORE(events_sent,              evtstream_state.events_sent);
     STORE(events_decoded,           evtstream_state.events_decoded);
+    STORE(events_dropped,           evtstream_state.events_dropped);
     STORE(usb_drops,                evtstream_state.usb_drops);
     STORE(cache_mismatches,         evtstream_state.cache_mismatches);
     STORE(window_truncated_total,   evtstream_state.window_truncated_total);
-    STORE(ring_lost_events_total,   evtstream_state.ring_lost_events_total);
     STORE(csi_dma_underruns,        evtstream_state.csi_dma_underruns);
     STORE(last_window_event_count,  evtstream_state.last_window_event_count);
     STORE(last_fb_pixel_count,      evtstream_state.last_fb_pixel_count);
+    STORE(last_ring_fill,           evtstream_state.last_ring_fill);
     STORE(last_window_us,           evtstream_state.last_window_us);
     STORE(sequence,                 evtstream_state.sequence);
     #undef STORE
