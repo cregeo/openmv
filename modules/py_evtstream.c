@@ -25,21 +25,24 @@
  *
  * evtstream — fixed-cadence event streaming for GenX320 on OpenMV RT1062.
  *
- * STEP 3a: cache-management stress test. `evtstream.bench_cache()`
- * allocates the four DRAM working buffers (ring 32 KB, TX A/B 16 KB
- * each, mock FB 6 KB) at production sizes via fb_alloc and exercises
- * the SCB_CleanDCache_by_Addr / SCB_InvalidateDCache_by_Addr sequence
- * from the PIT ISR at 1 kHz. Per-window mismatches are counted and
- * surfaced via stats()['cache_mismatches']. PASS = zero mismatches over
- * 10 seconds (DESIGN.md §11a step 3a).
+ * STEP 4: CSI integration (decode-and-discard). `evtstream.bench_csi()`
+ * configures the GenX320 in continuous ping-pong DMA at h=6 lines (the
+ * production geometry per DESIGN.md §3a / §7a) and registers a CSI-IRQ
+ * decoder that walks EVT2.0 words and counts pixel events into
+ * `events_decoded` / `last_fb_pixel_count`. No ring buffer or USB
+ * shipping yet — that's step 5. Sensor must be initialised in EVENT
+ * mode by the caller (csi.CSI(cid=csi.GENX320) +
+ * csi.IOCTL_GENX320_SET_MODE) before bench_csi(). The PIT timer keeps
+ * running as a passive heartbeat (last_window_us / windows_sent stay
+ * live) but doesn't drive any data work in this step.
  *
  * Steps prior:
  *   1.  skeleton (start/stop/stats flags only)
  *   2.  PIT-only path
  *   3.  synthetic USB CDC throughput benchmark
+ *   3a. cache-management stress test
  *
  * Subsequent steps add (per DESIGN.md §11a):
- *   4.  CSI integration (continuous-mode capture + decode)
  *   5.  full path (PIT drains ring into CDC packets)
  *   6.  CSI exclusivity hook
  *   7.  failure mode handling
@@ -66,6 +69,27 @@
 
 // fb_alloc / fb_free for the DRAM-resident TX buffers (DESIGN.md §3a).
 #include "framebuffer.h"
+
+// CSI handle + GenX320 chip-id constants for the bench_csi step-4 path.
+#include "omv_csi.h"
+
+// EVT2.0 wire format macros + type constants (TD_LOW, TD_HIGH,
+// EV_TIME_HIGH, EXT_TRIGGER). Vendored under drivers/genx320/include
+// and reachable via the existing OMV_GENX320_ENABLE include path.
+#include "evt_2_0.h"
+
+// Port-side helpers from ports/mimxrt/omv_csi.c (commit 9ec4d5d). They
+// configure the i.MX CSI peripheral for continuous ping-pong DMA into
+// caller-provided buffers and route per-FB-done IRQs to a registered
+// callback. The cache-invalidate barrier sequence in the line-callback
+// hook was hardened in commit c86ad4f after step 3a.
+extern int imx_csi_streaming_start(omv_csi_t *csi,
+                                   uint8_t *fb1, uint8_t *fb2,
+                                   uint16_t dma_line_bytes,
+                                   uint16_t height_lines,
+                                   void (*cb)(uint8_t *, void *),
+                                   void *arg);
+extern void imx_csi_streaming_stop(omv_csi_t *csi);
 
 // PIT channel allocated to evtstream. Channels 1-3 stay free for any
 // future use (e.g. a second timer for failure-mode detection).
@@ -150,17 +174,31 @@ static struct {
     uint32_t bench_cache_mock_fb_words;  // mock_fb size / 4
     volatile uint32_t bench_cache_pattern_counter;
 
+    // CSI-bench mode (step 4). bench_csi_mode toggles the continuous-
+    // DMA + decode-and-discard path. fb1/fb2 are 6 KB each (h=6 lines
+    // × 1024 dma_line_bytes) per DESIGN.md §3a final placement. They
+    // are written by CSI DMA (cache-invalidated in the port-side
+    // line-callback hook) and read by the decoder cb in CSI ISR
+    // context.
+    volatile bool bench_csi_mode;
+    uint8_t *bench_csi_fb1;
+    uint8_t *bench_csi_fb2;
+    uint32_t bench_csi_fb_size_bytes;
+
     // Stats counters. windows_sent / sequence / last_window_us start being
     // touched in step 2; events_sent / usb_drops / last_window_event_count
-    // start in step 3; cache_mismatches in step 3a; the rest stay zero
-    // until later steps wire them.
+    // start in step 3; cache_mismatches in step 3a; events_decoded /
+    // last_fb_pixel_count in step 4; the rest stay zero until later
+    // steps wire them.
     volatile uint32_t windows_sent;
     volatile uint32_t events_sent;
     volatile uint32_t usb_drops;
     volatile uint32_t cache_mismatches;
+    volatile uint32_t events_decoded;
+    volatile uint32_t last_fb_pixel_count;
     uint32_t window_truncated_total;
     uint32_t ring_lost_events_total;
-    uint32_t csi_dma_underruns;
+    volatile uint32_t csi_dma_underruns;
     volatile uint32_t last_window_event_count;
     volatile uint32_t last_window_us;
     volatile uint32_t sequence;
@@ -226,6 +264,41 @@ static void bench_build_and_ship(uint8_t *buf,
     tud_cdc_write_flush();
     evtstream_state.events_sent += n_events;
     evtstream_state.last_window_event_count = n_events;
+}
+
+// CSI ISR decoder for step 4. Called from omv_csi_line_callback's
+// streaming-mode short-circuit (ports/mimxrt/omv_csi.c) once per FB-done
+// interrupt. By the time we get here:
+//   * The full FB-bytes worth of EVT2.0 words have been DMAed by the
+//     CSI peripheral into `fb_addr` (one of the two ping-pong buffers).
+//   * The port-side hook has already done __DSB() / SCB_InvalidateDCache /
+//     __DSB() / __ISB() so the cache lines covering fb_addr are fresh
+//     reads from physical DRAM.
+//
+// This step counts pixel events only (TD_LOW + TD_HIGH) and discards
+// the data. Step 5 will replace this with a ring-buffer writer that
+// produces wire-format events for the PIT drainer to ship.
+static void bench_csi_decode_cb(uint8_t *fb_addr, void *arg) {
+    (void) arg;
+    const uint32_t *words = (const uint32_t *) fb_addr;
+    const uint32_t n_words =
+        evtstream_state.bench_csi_fb_size_bytes / sizeof(uint32_t);
+
+    uint32_t pix = 0;
+    for (uint32_t i = 0; i < n_words; i++) {
+        const uint32_t v = words[i];
+        const uint32_t type = __EVT20_TYPE(v);
+        if (type == TD_LOW || type == TD_HIGH) {
+            pix++;
+        }
+        // EV_TIME_HIGH and EXT_TRIGGER words are present in the stream
+        // but not counted here. Step 5 tracks the EV_TIME_HIGH 64-bit
+        // accumulator to anchor wire-event timestamps; for step 4 the
+        // pixel count is the only signal we need to confirm the
+        // CSI -> decode path works end-to-end.
+    }
+    evtstream_state.events_decoded += pix;
+    evtstream_state.last_fb_pixel_count = pix;
 }
 
 // Run one window's worth of the cache-management stress test (step 3a).
@@ -346,13 +419,17 @@ void PIT_IRQHandler(void) {
 
 // Shared helpers for start() / bench() / stop() ------------------------
 
-// Resets counters that the PIT ISR touches. Other counters (e.g. ones
-// that production code adds in later steps) stay where they are.
+// Resets counters that the PIT or CSI ISR touches. Other counters
+// (e.g. ones that production code adds in later steps) stay where
+// they are.
 static void evtstream_reset_isr_counters(void) {
     evtstream_state.windows_sent = 0;
     evtstream_state.events_sent = 0;
     evtstream_state.usb_drops = 0;
     evtstream_state.cache_mismatches = 0;
+    evtstream_state.events_decoded = 0;
+    evtstream_state.last_fb_pixel_count = 0;
+    evtstream_state.csi_dma_underruns = 0;
     evtstream_state.last_window_event_count = 0;
     evtstream_state.sequence = 0;
     evtstream_state.last_window_us = 0;
@@ -603,6 +680,105 @@ static mp_obj_t py_evtstream_bench_cache(size_t n_args, const mp_obj_t *pos_args
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(py_evtstream_bench_cache_obj, 0, py_evtstream_bench_cache);
 
+// evtstream.bench_csi(window_us=1000)
+//
+// CSI integration step 4: configure GenX320 + i.MX CSI for continuous
+// ping-pong DMA at h=6 lines (production geometry per DESIGN.md §3a /
+// §7a) and run a decode-and-discard loop in CSI ISR context.
+// `events_decoded` and `last_fb_pixel_count` track pixel events; the
+// raw EVT2.0 data is not buffered. PIT runs at `window_us` cadence as
+// a passive heartbeat (windows_sent / sequence / last_window_us stay
+// live for visibility).
+//
+// Caller must have configured the GenX320 in EVENT mode beforehand:
+//
+//     csi0 = csi.CSI(cid=csi.GENX320)
+//     csi0.reset()
+//     csi0.ioctl(csi.IOCTL_GENX320_SET_MODE, csi.GENX320_MODE_EVENT, 4096)
+//     evtstream.bench_csi()
+//     time.sleep(10)
+//     s = evtstream.stats()
+//     evtstream.stop()
+//
+// Step 4 deliberately does not own the sensor mode — the existing
+// IOCTL handler takes care of mode setup, and we'd rather inherit that
+// path than duplicate it. Step 5 / production may revisit this if
+// having start() handle sensor setup turns out to be more ergonomic.
+static mp_obj_t py_evtstream_bench_csi(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_window_us };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_window_us, MP_ARG_INT, {.u_int = 1000} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args, pos_args, kw_args,
+                     MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+
+    int window_us = args[ARG_window_us].u_int;
+    if (window_us < 100 || window_us > 10000) {
+        mp_raise_ValueError(MP_ERROR_TEXT("window_us must be in [100, 10000]"));
+    }
+    if (evtstream_state.running) {
+        mp_raise_OSError(MP_EBUSY);
+    }
+
+    omv_csi_t *csi = omv_csi_get(-1);
+    if (csi == NULL) {
+        mp_raise_msg(&mp_type_OSError,
+                     MP_ERROR_TEXT("no CSI configured — call csi.CSI(cid=csi.GENX320) first"));
+    }
+    if (csi->chip_id != GENX320_ID_ES && csi->chip_id != GENX320_ID_MP) {
+        mp_raise_msg(&mp_type_OSError,
+                     MP_ERROR_TEXT("attached sensor is not a GenX320"));
+    }
+
+    // Production FB geometry per DESIGN.md §7a: h=6 lines × 1024
+    // dma_line_bytes = 6 KB per ping-pong buffer. CACHE_ALIGN per the
+    // step-3a finding that unaligned buffers caused cache-pattern
+    // races.
+    const uint16_t dma_line_bytes = 1024;
+    const uint16_t height_lines = 6;
+    const uint32_t fb_bytes = (uint32_t) dma_line_bytes * (uint32_t) height_lines;
+
+    uint8_t *fb1 = fb_alloc(fb_bytes, FB_ALLOC_CACHE_ALIGN);
+    uint8_t *fb2 = fb_alloc(fb_bytes, FB_ALLOC_CACHE_ALIGN);
+
+    evtstream_state.bench_csi_fb1 = fb1;
+    evtstream_state.bench_csi_fb2 = fb2;
+    evtstream_state.bench_csi_fb_size_bytes = fb_bytes;
+    evtstream_state.window_us = (uint32_t) window_us;
+
+    evtstream_reset_isr_counters();
+
+    evtstream_state.running = true;
+    evtstream_state.bench_csi_mode = true;
+    __DSB();
+
+    int rc = imx_csi_streaming_start(csi, fb1, fb2,
+                                     dma_line_bytes, height_lines,
+                                     bench_csi_decode_cb, NULL);
+    if (rc != 0) {
+        evtstream_state.bench_csi_mode = false;
+        evtstream_state.running = false;
+        fb_free();  // fb2
+        fb_free();  // fb1
+        mp_raise_msg(&mp_type_OSError,
+                     MP_ERROR_TEXT("imx_csi_streaming_start failed"));
+    }
+
+    // PIT for passive heartbeat. Failure here is recoverable — tear down
+    // CSI and free buffers before raising.
+    if (evtstream_arm_pit((uint32_t) window_us) < 0) {
+        imx_csi_streaming_stop(csi);
+        evtstream_state.bench_csi_mode = false;
+        evtstream_state.running = false;
+        fb_free();  // fb2
+        fb_free();  // fb1
+        mp_raise_ValueError(MP_ERROR_TEXT("PIT period out of range"));
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(py_evtstream_bench_csi_obj, 0, py_evtstream_bench_csi);
+
 // evtstream.stop()
 //
 // Disables the PIT timer and its IRQ. Silent no-op if not running.
@@ -645,6 +821,22 @@ static mp_obj_t py_evtstream_stop(void) {
         fb_free();  // tx_b
         fb_free();  // tx_a
         fb_free();  // ring
+    } else if (evtstream_state.bench_csi_mode) {
+        // Tear down CSI ping-pong DMA before clearing the mode flag, so
+        // imx_csi_streaming_stop's __DSB / NVIC sequence completes
+        // against the still-active state. Then drop the mode flag and
+        // free the FB buffers (LIFO: fb2 → fb1).
+        omv_csi_t *csi = omv_csi_get(-1);
+        if (csi != NULL) {
+            imx_csi_streaming_stop(csi);
+        }
+        evtstream_state.bench_csi_mode = false;
+        __DSB();
+        evtstream_state.bench_csi_fb1 = NULL;
+        evtstream_state.bench_csi_fb2 = NULL;
+        evtstream_state.bench_csi_fb_size_bytes = 0;
+        fb_free();  // fb2
+        fb_free();  // fb1
     }
 
     evtstream_state.running = false;
@@ -654,24 +846,29 @@ static MP_DEFINE_CONST_FUN_OBJ_0(py_evtstream_stop_obj, py_evtstream_stop);
 
 // evtstream.stats()
 //
-// Returns a snapshot of the counter dict. After step 3a:
+// Returns a snapshot of the counter dict. After step 4:
 //   - windows_sent, sequence, last_window_us — live in any mode (PIT-driven)
 //   - events_sent, usb_drops, last_window_event_count — live in bench mode
 //   - cache_mismatches — live in bench_cache mode
-//   - window_truncated_total, ring_lost_events_total, csi_dma_underruns —
-//     wired in steps 4-7
+//   - events_decoded, last_fb_pixel_count — live in bench_csi mode
+//   - csi_dma_underruns — defined; not driven yet (no underrun signal in
+//     step 4's path), wired in step 5 when the ring-buffer drain pattern
+//     gives us a real "expected fire missing" signal
+//   - window_truncated_total, ring_lost_events_total — wired in step 5
 static mp_obj_t py_evtstream_stats(void) {
-    mp_obj_t d = mp_obj_new_dict(10);
+    mp_obj_t d = mp_obj_new_dict(12);
     #define STORE(key, val) \
         mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_##key), mp_obj_new_int_from_uint(val))
     STORE(windows_sent,             evtstream_state.windows_sent);
     STORE(events_sent,              evtstream_state.events_sent);
+    STORE(events_decoded,           evtstream_state.events_decoded);
     STORE(usb_drops,                evtstream_state.usb_drops);
     STORE(cache_mismatches,         evtstream_state.cache_mismatches);
     STORE(window_truncated_total,   evtstream_state.window_truncated_total);
     STORE(ring_lost_events_total,   evtstream_state.ring_lost_events_total);
     STORE(csi_dma_underruns,        evtstream_state.csi_dma_underruns);
     STORE(last_window_event_count,  evtstream_state.last_window_event_count);
+    STORE(last_fb_pixel_count,      evtstream_state.last_fb_pixel_count);
     STORE(last_window_us,           evtstream_state.last_window_us);
     STORE(sequence,                 evtstream_state.sequence);
     #undef STORE
@@ -684,6 +881,7 @@ static const mp_rom_map_elem_t evtstream_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_start),       MP_ROM_PTR(&py_evtstream_start_obj)       },
     { MP_ROM_QSTR(MP_QSTR_bench),       MP_ROM_PTR(&py_evtstream_bench_obj)       },
     { MP_ROM_QSTR(MP_QSTR_bench_cache), MP_ROM_PTR(&py_evtstream_bench_cache_obj) },
+    { MP_ROM_QSTR(MP_QSTR_bench_csi),   MP_ROM_PTR(&py_evtstream_bench_csi_obj)   },
     { MP_ROM_QSTR(MP_QSTR_stop),        MP_ROM_PTR(&py_evtstream_stop_obj)        },
     { MP_ROM_QSTR(MP_QSTR_stats),       MP_ROM_PTR(&py_evtstream_stats_obj)       },
 };
