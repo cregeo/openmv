@@ -747,6 +747,13 @@ static void evtstream_disarm_pit(void) {
 //     evtstream.start(window_us=1000)
 //     time.sleep(N)
 //     evtstream.stop()
+//
+// After stop(), the sensor is in factory-default state (HISTO mode for
+// GenX320). To start another EVENT-mode session on the same csi0
+// handle, re-issue IOCTL_GENX320_SET_MODE before calling start() again.
+// This is intentional -- stop() hard-resets the sensor (CSI reset pin
+// toggle) to recover from in-progress CPI state that streaming can
+// leave in a stuck state. See the long comment in stop() for details.
 static mp_obj_t py_evtstream_start(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum { ARG_window_us, ARG_max_events_per_window };
     static const mp_arg_t allowed_args[] = {
@@ -1133,7 +1140,8 @@ static mp_obj_t py_evtstream_stop(void) {
         // Tear down CSI ping-pong DMA before clearing the mode flag, so
         // imx_csi_streaming_stop's __DSB / NVIC sequence completes
         // against the still-active state. Then drop the mode flag and
-        // free the FB buffers (LIFO: fb2 → fb1).
+        // free the FB buffers (LIFO: fb2 -> fb1). Finally hard-reset the
+        // sensor (see comment on the stream_mode branch below).
         omv_csi_t *csi = omv_csi_get(-1);
         if (csi != NULL) {
             imx_csi_streaming_stop(csi);
@@ -1145,10 +1153,37 @@ static mp_obj_t py_evtstream_stop(void) {
         evtstream_state.bench_csi_fb_size_bytes = 0;
         fb_free();  // fb2
         fb_free();  // fb1
+        if (csi != NULL) {
+            omv_csi_reset(csi, true);
+        }
     } else if (evtstream_state.stream_mode) {
         // Production teardown. PIT is already disarmed above; stop CSI
         // (no more events into ring), then free buffers in reverse-
         // allocation order: fb2 -> fb1 -> tx_b -> tx_a -> ring.
+        //
+        // Hard-reset the sensor at the end so the user's pre-existing
+        // CSI handle (csi0) returns to a clean state. Background:
+        //
+        // During streaming the GenX320's CPI block keeps emitting events
+        // onto the wire that imx_csi_abort just disabled draining of.
+        // The sensor's internal CPI FIFO can fill and stall, which on
+        // some silicon manifests as the next I2C transaction (e.g.
+        // psee_sensor_stop inside IOCTL_GENX320_SET_MODE) hanging long
+        // enough to trip the M7's watchdog -- which on RT1062 takes USB
+        // OTG down and requires a physical replug to recover.
+        // Reproduced deterministically in the step-6 hardware run.
+        //
+        // omv_csi_reset(csi, true) toggles the CSI reset pin, which
+        // power-cycles the sensor regardless of its CPI / I2C state.
+        // After this the sensor is in factory default (HISTO mode for
+        // GenX320). Callers who want to keep using EVENT mode must
+        // re-issue IOCTL_GENX320_SET_MODE -- documented in the public
+        // start() docstring.
+        //
+        // The reset call is a direct C-level invocation; it bypasses
+        // py_csi_reset's EBUSY hook (which only fires on the Python
+        // wrapper layer). Safe to call here even with the running flag
+        // still set.
         omv_csi_t *csi = omv_csi_get(-1);
         if (csi != NULL) {
             imx_csi_streaming_stop(csi);
@@ -1165,6 +1200,9 @@ static mp_obj_t py_evtstream_stop(void) {
         fb_free();  // tx_b
         fb_free();  // tx_a
         fb_free();  // ring
+        if (csi != NULL) {
+            omv_csi_reset(csi, true);
+        }
     }
 
     evtstream_state.running = false;
