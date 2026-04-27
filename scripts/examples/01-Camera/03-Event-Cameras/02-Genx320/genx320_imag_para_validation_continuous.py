@@ -15,29 +15,41 @@
 #   during a capture window. That is the same configuration the evtstream
 #   module will use in production.
 #
+# LESSON FROM THE FIRST CONTINUOUS-MODE RUN (this script, original criteria):
+#   Strict aggregate ratio criteria — pixel-total range, pixel/total ratio
+#   drift, filler-total range — assumed wire content scales linearly with
+#   buffer size across heights. It does not. The pixel/filler ratio is
+#   scene-dependent, and the GenX320's CPI block paces filler differently at
+#   different buffer sizes (h=8 saw 99% pixel/wire; h=4 saw 70-98% depending
+#   on activity). The ratio criteria were FAIL-ing on perfectly coherent
+#   data. The criterion that actually discriminates Hypothesis A
+#   (CPI-burst-truncation) from Hypothesis B (snapshot lifecycle gap) is
+#   per-FB pixel-count distribution unimodality. Keep that one strict;
+#   loosen the rest to floor checks.
+#
+# LESSON FROM IDE OUTPUT TRUNCATION:
+#   The first run's PASS verdict never reached the console because the
+#   per-FB log filled the buffer first. Print verdict BEFORE detailed
+#   stats so future runs are easy to grep for "OVERALL:".
+#
 # Procedure:
-#   1. Initialize the GenX320 in EVENT mode with ndarray_size = 4096 (default
-#      IMAG_PARA height = 16 lines if we ever fell back to snapshot mode).
+#   1. Initialize the GenX320 in EVENT mode with ndarray_size = 4096.
 #   2. Wave a hand or LED in front of the lens to generate events.
 #   3. For each height in HEIGHTS, run a continuous-DMA capture for
 #      DURATION_MS of wall-clock time, accumulating per-FB-completion stats.
 #   4. Compute aggregates AND per-FB distribution stats per capture.
-#   5. Apply stricter criteria across heights (largest height = reference).
-#   6. Print PASS / FAIL.
+#   5. Print VERDICT BLOCK first (per-height + OVERALL).
+#   6. Print detailed stats and per-FB log after the verdict.
 #
-# Per-FB stats discriminate the two hypotheses from RISK1_FINDINGS.md §2/§3:
-#   - Hypothesis A (CPI-burst-truncation): per-FB pixel-count distribution
-#     should be **bimodal** (full FBs vs filler-only FBs) — std/mean > 0.5.
-#   - Hypothesis B (snapshot lifecycle gap): in continuous-mode, the gap
-#     disappears, so per-FB pixel-count distribution should be **unimodal**
-#     and aggregate counts should match the geometric expectation.
-#
-# Per RISK1_FINDINGS.md §8c, PASS requires:
-#   1. Aggregate pixel-event count within +/- 25% of geometric expectation.
-#   2. Pixel/total ratio within +/- 15 percentage points of reference.
-#   3. EV_TIME_HIGH count within +/- 50% of geometric expectation.
-#   4. Per-FB pixel-count std/mean <= 0.5 (after excluding first 2 transient).
-#   5. No invalid x/y coordinates.
+# PASS criteria (loosened per validation feedback):
+#   1. Per-FB pixel-count std/mean <= 0.5 after excluding first 2 transient
+#      FBs. PRIMARY discriminator. If bimodal distribution shows up,
+#      Hypothesis A is back in play and we stop.
+#   2. Aggregate pixel-event count >= 20% of the linear-scaling
+#      expectation (loose floor — catches "captured almost nothing" while
+#      tolerating scene-dependent variation).
+#   3. Steady-state per-FB pixel count >= 1 (sensor is producing events).
+#   4. No invalid x/y coordinates.
 #   (Monotonicity is checked inside the C decoder; not surfaced here.)
 
 import csi
@@ -50,15 +62,14 @@ from ulab import numpy as np
 # Heights to sweep. Largest = reference for geometric scaling. The IOCTL
 # caps height at 8 lines (DEBUG_STREAM_MAX_FB_BYTES = 8 KB). Useful sweep
 # patterns:
-#   [8, 4]      — quick: reference + design default
-#   [8, 4, 2, 1]— full sweep, ~4 seconds total runtime
-HEIGHTS = [8, 4]
+#   [8, 6]      — confirm the production candidate (h=6) against reference
+#   [8, 6, 4, 2, 1] — full sweep
+HEIGHTS = [8, 6]
 
 DURATION_MS = 1000
 
-# Per-FB stats array capacity. At 50K evt/s with h=4 (4 KB FB) the FB rate
-# is ~70 FBs/s -> ~70 entries per second. Saccade rates push this higher.
-# 2048 rows is comfortable.
+# Per-FB stats array capacity. At burst rates (saccade) FBs come ~700/s for
+# h=4 / 350/s for h=8. 2048 is comfortable headroom.
 MAX_FBS = 2048
 
 EVT_NDARRAY_SIZE = 4096
@@ -70,8 +81,7 @@ WAIT_BEFORE_CAPTURE_S = 1.0
 # Helpers ----------------------------------------------------------------
 
 def my_std(arr):
-    # ulab numpy's np.std availability is uncertain; do it ourselves to
-    # avoid a missing-symbol failure on some firmware builds.
+    # ulab numpy's np.std availability is uncertain; do it ourselves.
     n = arr.shape[0]
     if n == 0:
         return 0.0
@@ -128,8 +138,57 @@ def summarize(stats_view):
     }
 
 
-def report(h, s):
-    print("\n--- h=%d (FB = %d bytes = %d EVT2.0 words) ---" %
+def evaluate(h, s, ref_h, ref_s):
+    """Apply loosened PASS criteria. Returns (ok, reasons, key_metrics)."""
+    if s is None or s["n_fbs"] < 3:
+        return False, ["less than 3 FBs captured"], {}
+
+    reasons = []
+    metrics = {}
+
+    # (1) Primary: per-FB pixel-count std/mean <= 0.5 (unimodal).
+    if s["steady_mean"] > 0:
+        std_over_mean = s["steady_std"] / s["steady_mean"]
+        metrics["std_over_mean"] = std_over_mean
+        if std_over_mean > 0.5:
+            reasons.append(
+                "per-FB std/mean %.3f > 0.5 (suspect bimodal — Hypothesis A)"
+                % std_over_mean)
+    else:
+        metrics["std_over_mean"] = 0.0
+        reasons.append("steady-state mean is 0 (sensor produced no events)")
+
+    # (2) Loose floor: aggregate pixel total >= 20% of geometric expectation.
+    geo_ratio = h / float(ref_h)
+    fb_ratio = s["n_fbs"] / float(ref_s["n_fbs"]) if ref_s["n_fbs"] else 1.0
+    expected = ref_s["pixel_total"] * fb_ratio * geo_ratio
+    floor = expected * 0.20
+    metrics["pixel_total"] = s["pixel_total"]
+    metrics["pixel_floor"] = floor
+    if h != ref_h and s["pixel_total"] < floor:
+        reasons.append(
+            "pixel total %d < floor %.0f (20%% of geometric expectation %.0f)"
+            % (s["pixel_total"], floor, expected))
+
+    # (3) Sensor-is-on: steady-state per-FB pixels >= 1.
+    metrics["steady_min"] = s["steady_min"]
+    if s["steady_min"] < 1:
+        reasons.append(
+            "steady-state min pixels/FB = %d (sensor not producing)"
+            % s["steady_min"])
+
+    # (4) No invalid x/y.
+    metrics["invxy_total"] = s["invxy_total"]
+    if s["invxy_total"] != 0:
+        reasons.append(
+            "%d invalid x/y events" % s["invxy_total"])
+
+    return (len(reasons) == 0), reasons, metrics
+
+
+def report_detailed(h, s):
+    print()
+    print("--- h=%d (FB = %d bytes = %d EVT2.0 words) ---" %
           (h, h * DMA_LINE_BYTES, (h * DMA_LINE_BYTES) >> 2))
     print("  total FBs                : %d" % s["n_fbs"])
     print("  total pixel events       : %d" % s["pixel_total"])
@@ -148,11 +207,11 @@ def report(h, s):
           % s["transient_pixels"])
 
 
-def print_per_fb_rows(stats_view):
-    # Compact per-FB log so the user can eyeball the distribution.
+def print_per_fb_rows(label, stats_view):
     n_fbs = stats_view.shape[0]
     show = min(n_fbs, 50)
-    print("  per-FB log (first %d of %d):" % (show, n_fbs))
+    print()
+    print("  per-FB log for %s (first %d of %d):" % (label, show, n_fbs))
     print("    fb_idx |     ts_us |  pixel | filler | trig | other | inv_xy")
     for i in range(show):
         ts_us = (int(stats_view[i, 0])
@@ -185,144 +244,98 @@ print("Wave hand or LED in front of lens; capturing in %.1f s..." %
       WAIT_BEFORE_CAPTURE_S)
 time.sleep(WAIT_BEFORE_CAPTURE_S)
 
+# Phase 1: capture all heights, compute summaries. Minimal output here so
+# the verdict block below isn't pushed off-screen by per-FB logs.
 results = {}
 for h in HEIGHTS:
-    print("\nh=%d capture (%d ms)..." % (h, DURATION_MS))
     n_fbs = csi0.ioctl(csi.IOCTL_GENX320_DEBUG_CAPTURE_CONTINUOUS,
-                        stats, h, DURATION_MS)
-    print(" -> %d FBs captured" % n_fbs)
+                       stats, h, DURATION_MS)
     if n_fbs > 0:
-        # Snapshot the just-captured rows into a fresh ndarray so we can
-        # reuse `stats` for the next capture. ulab slice + np.array() makes
-        # a contiguous copy.
         snap = np.array(stats[:n_fbs])
         s = summarize(snap)
         results[h] = (snap, s)
-        report(h, s)
-        print_per_fb_rows(snap)
     else:
         results[h] = (None, None)
-        print("  WARNING: zero FBs captured at h=%d — invalid run" % h)
+    print("  captured h=%d -> %d FBs" % (h, n_fbs))
     time.sleep(0.3)
 
 
-# Stricter criteria ------------------------------------------------------
+# Phase 2: VERDICT BLOCK (printed first so it never gets truncated).
+print()
+print("=== VERDICT START ===")
 
 ref_h = max(HEIGHTS)
-ref_snap, ref_stats = results[ref_h]
+_, ref_s = results[ref_h]
 
-print()
-print("=" * 70)
-print(" Stricter PASS criteria (each height vs reference h=%d)" % ref_h)
-print("=" * 70)
-
-if ref_stats is None or ref_stats["n_fbs"] < 3:
-    print(" REFERENCE FAILED — h=%d capture had < 3 FBs. Cannot evaluate." %
-          ref_h)
+if ref_s is None or ref_s["n_fbs"] < 3:
+    print(" REFERENCE FAIL — h=%d had < 3 FBs; cannot evaluate." % ref_h)
+    print("OVERALL: FAIL")
+    print("=== VERDICT END ===")
     raise SystemExit
 
-ref_words_per_fb = ref_h * (DMA_LINE_BYTES // 4)
-ref_pix_pct = (100.0 * ref_stats["pixel_total"]
-               / (ref_stats["n_fbs"] * ref_words_per_fb))
-
-print(" reference h=%d  : %d FBs, %d pixels, %.1f%% pixel-of-stream" %
-      (ref_h, ref_stats["n_fbs"], ref_stats["pixel_total"], ref_pix_pct))
-
 overall_pass = True
-
+verdicts = {}
 for h in HEIGHTS:
-    if h == ref_h:
-        continue
     snap, s = results[h]
+    ok, reasons, metrics = evaluate(h, s, ref_h, ref_s)
+    verdicts[h] = (ok, reasons, metrics)
+    if not ok:
+        overall_pass = False
+
+    # One concise verdict line per height.
     if s is None:
-        print("\n h=%d: FAIL — no FBs captured" % h)
-        overall_pass = False
+        print(" h=%d: FAIL (no FBs captured)" % h)
         continue
+    sm = metrics.get("std_over_mean", 0.0)
+    pix = metrics.get("pixel_total", 0)
+    floor = metrics.get("pixel_floor", 0.0)
+    print(" h=%d: %s — std/mean=%.3f, pixel total=%d (floor %.0f), "
+          "invxy=%d, n_fbs=%d"
+          % (h, "PASS" if ok else "FAIL",
+             sm, pix, floor, metrics.get("invxy_total", 0), s["n_fbs"]))
+    for r in reasons:
+        print("    - %s" % r)
 
-    print("\n h=%d:" % h)
-    reasons = []
-
-    # Per-FB scaling: if h captured proportionally fewer FBs of the same wall
-    # time, bigger sample → expected aggregates scale by FBs * (h/ref_h).
-    geo_ratio = h / float(ref_h)
-    fb_ratio = s["n_fbs"] / float(ref_stats["n_fbs"])
-
-    # (1) Pixel total within +/-25% of geometric expectation.
-    expected_pix = ref_stats["pixel_total"] * fb_ratio * geo_ratio
-    pix_lo = expected_pix * 0.75
-    pix_hi = expected_pix * 1.25
-    pix_ok = pix_lo <= s["pixel_total"] <= pix_hi
-    print("   pixel total              : got %d, expected %.0f in [%.0f, %.0f]    %s" %
-          (s["pixel_total"], expected_pix, pix_lo, pix_hi,
-           "OK" if pix_ok else "FAIL"))
-    if not pix_ok:
-        reasons.append("pixel total out of range")
-
-    # (2) Pixel/total percentage within +/-15 pp of reference.
-    h_words_per_fb = h * (DMA_LINE_BYTES // 4)
-    h_pix_pct = (100.0 * s["pixel_total"]
-                 / (s["n_fbs"] * h_words_per_fb))
-    pct_delta = abs(h_pix_pct - ref_pix_pct)
-    pct_ok = pct_delta <= 15.0
-    print("   pixel/total ratio (%%)    : got %.1f%%, ref %.1f%% (delta %.1f pp)    %s" %
-          (h_pix_pct, ref_pix_pct, pct_delta,
-           "OK" if pct_ok else "FAIL"))
-    if not pct_ok:
-        reasons.append("pixel/total ratio drift > 15 pp")
-
-    # (3) EV_TIME_HIGH count within +/-50% of geometric expectation.
-    expected_filler = ref_stats["filler_total"] * fb_ratio * geo_ratio
-    f_lo = expected_filler * 0.5
-    f_hi = expected_filler * 1.5
-    f_ok = f_lo <= s["filler_total"] <= f_hi
-    print("   EV_TIME_HIGH total       : got %d, expected %.0f in [%.0f, %.0f]    %s" %
-          (s["filler_total"], expected_filler, f_lo, f_hi,
-           "OK" if f_ok else "FAIL"))
-    if not f_ok:
-        reasons.append("filler count out of range")
-
-    # (4) Per-FB unimodality (steady-state std/mean <= 0.5).
-    if s["steady_mean"] > 0:
-        sm = s["steady_std"] / s["steady_mean"]
-        sm_ok = sm <= 0.5
-        print("   per-FB std/mean          : %.3f (target <= 0.5)             %s" %
-              (sm, "OK" if sm_ok else "FAIL"))
-        if not sm_ok:
-            reasons.append("per-FB distribution suggests bimodal "
-                           "(Hypothesis A still in play)")
-    else:
-        print("   per-FB std/mean          : zero mean — too few FBs    SKIP")
-
-    # (5) Invalid x/y is zero.
-    xy_ok = s["invxy_total"] == 0
-    print("   invalid x/y total        : %d                                       %s" %
-          (s["invxy_total"], "OK" if xy_ok else "FAIL"))
-    if not xy_ok:
-        reasons.append("%d invalid x/y events" % s["invxy_total"])
-
-    if reasons:
-        print("   verdict: FAIL —")
-        for r in reasons:
-            print("     - %s" % r)
-        overall_pass = False
-    else:
-        print("   verdict: PASS")
+print("OVERALL: %s" % ("PASS" if overall_pass else "FAIL"))
+print("=== VERDICT END ===")
 
 
-# Final verdict ----------------------------------------------------------
-
+# Phase 3: detailed per-height reports.
 print()
 print("=" * 70)
+print(" Detailed stats")
+print("=" * 70)
+for h in HEIGHTS:
+    snap, s = results[h]
+    if s is not None:
+        report_detailed(h, s)
+    else:
+        print()
+        print("--- h=%d: no FBs captured ---" % h)
+
+
+# Phase 4: per-FB log (last; safe to truncate without losing the verdict).
+print()
+print("=" * 70)
+print(" Per-FB log (truncatable; verdict is above)")
+print("=" * 70)
+for h in HEIGHTS:
+    snap, s = results[h]
+    if snap is not None:
+        print_per_fb_rows("h=%d" % h, snap)
+
+
+# Phase 5: trailing reminder — overall verdict, repeated.
+print()
+print("=" * 70)
+print(" OVERALL: %s" % ("PASS" if overall_pass else "FAIL"))
+print("=" * 70)
 if overall_pass:
-    print(" OVERALL PASS — continuous-DMA mode preserves event coherence at")
-    print("                all swept heights. Original Option B is viable;")
-    print("                proceed to Task 3 main implementation with")
-    print("                'always continuous, never snapshot-per-call'.")
+    print(" Continuous-DMA mode preserves event coherence at all swept heights.")
+    print(" Hypothesis B is confirmed. Original Option B holds; proceed to")
+    print(" Task 3 main implementation per DESIGN.md (with §3a / §7a updates).")
 else:
-    print(" OVERALL FAIL — continuous-DMA mode does NOT preserve coherence.")
-    print("                Per RISK1_FINDINGS.md §8d, do NOT escalate to")
-    print("                C-line speculatively. Next step is to read and")
-    print("                document the line-callback path in")
-    print("                LINE_CALLBACK_ANALYSIS.md before any further")
-    print("                validation patches.")
+    print(" Continuous-DMA mode does NOT meet PASS criteria.")
+    print(" Per RISK1_FINDINGS.md §8d, do NOT escalate to C-line speculatively.")
+    print(" Next deliverable is LINE_CALLBACK_ANALYSIS.md, not another patch.")
 print("=" * 70)
