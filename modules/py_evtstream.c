@@ -38,7 +38,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "py/runtime.h"
-#include "py/objdict.h"
 #include "py/mperrno.h"
 
 // Module state. All zero-initialised in BSS until start() touches it.
