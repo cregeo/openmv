@@ -25,19 +25,20 @@
  *
  * evtstream — fixed-cadence event streaming for GenX320 on OpenMV RT1062.
  *
- * STEP 3: synthetic USB CDC throughput benchmark. PIT channel 0 ticks at
- * window_us cadence (step 2). When in bench mode (`evtstream.bench(...)`),
- * the ISR additionally builds a production-format packet (header + N
- * synthetic events with a counter pattern) into one of two DRAM
- * ping-pong TX buffers and ships it via `tud_cdc_write` /
- * `tud_cdc_write_flush`. If the tinyusb CDC TX FIFO doesn't have room for
- * the whole packet at the moment of submit, the entire packet is dropped
- * and `usb_drops` increments — never partial writes. This lets the
- * benchmark output identify the FIFO-bounded throughput ceiling
- * unambiguously.
+ * STEP 3a: cache-management stress test. `evtstream.bench_cache()`
+ * allocates the four DRAM working buffers (ring 32 KB, TX A/B 16 KB
+ * each, mock FB 6 KB) at production sizes via fb_alloc and exercises
+ * the SCB_CleanDCache_by_Addr / SCB_InvalidateDCache_by_Addr sequence
+ * from the PIT ISR at 1 kHz. Per-window mismatches are counted and
+ * surfaced via stats()['cache_mismatches']. PASS = zero mismatches over
+ * 10 seconds (DESIGN.md §11a step 3a).
+ *
+ * Steps prior:
+ *   1.  skeleton (start/stop/stats flags only)
+ *   2.  PIT-only path
+ *   3.  synthetic USB CDC throughput benchmark
  *
  * Subsequent steps add (per DESIGN.md §11a):
- *   3a. cache-management stress test
  *   4.  CSI integration (continuous-mode capture + decode)
  *   5.  full path (PIT drains ring into CDC packets)
  *   6.  CSI exclusivity hook
@@ -138,12 +139,25 @@ static struct {
     volatile uint8_t bench_cur_tx_buf_idx;
     volatile uint32_t bench_pattern_counter;
 
+    // Cache-bench mode (step 3a). bench_cache_mode toggles the cache-
+    // management stress test. bench_cache_*_buf are fb_alloc'd at
+    // production sizes (DESIGN.md §3a) and fb_free'd at stop().
+    volatile bool bench_cache_mode;
+    uint8_t *bench_cache_ring;       // 32 KB
+    uint8_t *bench_cache_tx_a;       // 16 KB
+    uint8_t *bench_cache_tx_b;       // 16 KB
+    uint8_t *bench_cache_mock_fb;    // 6 KB (h=6 production size)
+    uint32_t bench_cache_mock_fb_words;  // mock_fb size / 4
+    volatile uint32_t bench_cache_pattern_counter;
+
     // Stats counters. windows_sent / sequence / last_window_us start being
     // touched in step 2; events_sent / usb_drops / last_window_event_count
-    // start in step 3; the rest stay zero until later steps wire them.
+    // start in step 3; cache_mismatches in step 3a; the rest stay zero
+    // until later steps wire them.
     volatile uint32_t windows_sent;
     volatile uint32_t events_sent;
     volatile uint32_t usb_drops;
+    volatile uint32_t cache_mismatches;
     uint32_t window_truncated_total;
     uint32_t ring_lost_events_total;
     uint32_t csi_dma_underruns;
@@ -214,12 +228,65 @@ static void bench_build_and_ship(uint8_t *buf,
     evtstream_state.last_window_event_count = n_events;
 }
 
+// Run one window's worth of the cache-management stress test (step 3a).
+// Pattern:
+//   1. Write pattern A into mock_fb (CPU writes, lands in cache).
+//   2. SCB_CleanDCache_by_Addr — push A from cache to physical DRAM.
+//   3. Write pattern B over the same buffer (B in cache; DRAM still has A).
+//   4. SCB_InvalidateDCache_by_Addr — discard cache lines (B is lost;
+//      DRAM retains A).
+//   5. Read back via a `volatile` pointer so the compiler can't keep
+//      pattern-B values in registers — must hit DRAM, must equal A.
+// If the SCB sequence is wrong (e.g. clean is broken, lines remain dirty;
+// or invalidate is broken, returns stale cache), the read-back differs
+// from A and we count the window as a mismatch.
+//
+// This is the testable direction (read after invalidate). The TX
+// direction (clean before USB DMA) is best-effort here per DESIGN.md
+// §11a — real verification is at step 5 integration when USB EHCI DMA
+// reads the cache-bypass path.
+static void bench_cache_iterate(void) {
+    uint32_t *buf = (uint32_t *) evtstream_state.bench_cache_mock_fb;
+    const uint32_t n = evtstream_state.bench_cache_mock_fb_words;
+    const uint32_t base = evtstream_state.bench_cache_pattern_counter++;
+
+    // Pattern A. Multiplying by the golden-ratio constant 0x9E3779B1
+    // gives a cheap per-window-unique seed so we don't accidentally
+    // match the previous window's contents.
+    const uint32_t a_seed = base * 0x9E3779B1u;
+    for (uint32_t i = 0; i < n; i++) {
+        buf[i] = a_seed + i;
+    }
+
+    SCB_CleanDCache_by_Addr((uint32_t *) buf, (int32_t) (n * sizeof(uint32_t)));
+
+    // Pattern B over the same buffer. Now in cache (modified); DRAM
+    // still holds pattern A from the clean above.
+    const uint32_t b_seed = a_seed ^ 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < n; i++) {
+        buf[i] = b_seed + i;
+    }
+
+    SCB_InvalidateDCache_by_Addr((uint32_t *) buf, (int32_t) (n * sizeof(uint32_t)));
+
+    // Read back. `volatile` defeats compiler caching of register values
+    // from the pattern-B write loop above; without it the compiler is
+    // permitted to skip the load and use the in-register pattern-B
+    // value, which would falsely PASS even with a broken invalidate.
+    volatile uint32_t *vbuf = (volatile uint32_t *) buf;
+    for (uint32_t i = 0; i < n; i++) {
+        if (vbuf[i] != a_seed + i) {
+            evtstream_state.cache_mismatches++;
+            break;  // count per-window, not per-element
+        }
+    }
+}
+
 // PIT IRQ handler. Overrides the NXP SDK weak default. Runs in IRQ
 // context at NVIC priority EVTSTREAM_PIT_NVIC_PRIO. In step 2 the body
-// is bounded (a few register accesses + counter increments). In step 3
-// bench mode adds a packet build + tud_cdc_write call inside this same
-// handler — at events_per_window=2048 that's ~50-100 µs, still well
-// under the 1 ms PIT period and below the saccade-budget L_pit term.
+// is bounded (a few register accesses + counter increments). Step 3
+// adds a packet build + tud_cdc_write call. Step 3a's cache stress test
+// at h=6 / 6 KB does ~30 µs of work per fire (3 % CPU at 1 kHz).
 void PIT_IRQHandler(void) {
     if (PIT_GetStatusFlags(PIT, EVTSTREAM_PIT_CHANNEL) & kPIT_TimerFlag) {
         PIT_ClearStatusFlags(PIT, EVTSTREAM_PIT_CHANNEL, kPIT_TimerFlag);
@@ -247,6 +314,8 @@ void PIT_IRQHandler(void) {
                            : evtstream_state.bench_tx_buf_b;
             evtstream_state.bench_cur_tx_buf_idx ^= 1;
             bench_build_and_ship(buf, now, evtstream_state.sequence);
+        } else if (evtstream_state.bench_cache_mode) {
+            bench_cache_iterate();
         }
     }
 
@@ -266,6 +335,7 @@ static void evtstream_reset_isr_counters(void) {
     evtstream_state.windows_sent = 0;
     evtstream_state.events_sent = 0;
     evtstream_state.usb_drops = 0;
+    evtstream_state.cache_mismatches = 0;
     evtstream_state.last_window_event_count = 0;
     evtstream_state.sequence = 0;
     evtstream_state.last_window_us = 0;
@@ -433,6 +503,76 @@ static mp_obj_t py_evtstream_bench(size_t n_args, const mp_obj_t *pos_args, mp_m
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(py_evtstream_bench_obj, 0, py_evtstream_bench);
 
+// evtstream.bench_cache(window_us=1000)
+//
+// Cache-management stress test (DESIGN.md §11a step 3a). Allocates the
+// four DRAM working buffers at production sizes via fb_alloc — ring
+// 32 KB, TX A/B 16 KB each, mock FB 6 KB (h=6) — and starts PIT at
+// `window_us` cadence. Each PIT fire runs `bench_cache_iterate()` which
+// exercises the production write/clean/invalidate/read pattern and
+// counts windows that fail the read-back check into
+// `stats()['cache_mismatches']`.
+//
+// PASS criterion (per DESIGN.md §11a): 0 cache_mismatches over a 10 s
+// run at 1 kHz. The intended call pattern is:
+//
+//     evtstream.bench_cache()
+//     time.sleep(10)
+//     s = evtstream.stats()
+//     evtstream.stop()
+//     assert s['cache_mismatches'] == 0
+//
+// Non-blocking like bench(); user controls duration via sleep + stop.
+static mp_obj_t py_evtstream_bench_cache(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_window_us };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_window_us, MP_ARG_INT, {.u_int = 1000} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args, pos_args, kw_args,
+                     MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+
+    int window_us = args[ARG_window_us].u_int;
+    if (window_us < 100 || window_us > 10000) {
+        mp_raise_ValueError(MP_ERROR_TEXT("window_us must be in [100, 10000]"));
+    }
+    if (evtstream_state.running) {
+        mp_raise_OSError(MP_EBUSY);
+    }
+
+    // Production buffer sizes per DESIGN.md §3a final placement table.
+    // fb_alloc / fb_free are LIFO — stop() frees in reverse order.
+    const uint32_t ring_bytes  = 32u * 1024u;
+    const uint32_t tx_bytes    = 16u * 1024u;
+    const uint32_t mock_fb_bytes = 6u * 1024u;
+    uint8_t *ring    = fb_alloc(ring_bytes, FB_ALLOC_NO_HINT);
+    uint8_t *tx_a    = fb_alloc(tx_bytes, FB_ALLOC_NO_HINT);
+    uint8_t *tx_b    = fb_alloc(tx_bytes, FB_ALLOC_NO_HINT);
+    uint8_t *mock_fb = fb_alloc(mock_fb_bytes, FB_ALLOC_NO_HINT);
+
+    evtstream_state.window_us = (uint32_t) window_us;
+    evtstream_state.bench_cache_ring   = ring;
+    evtstream_state.bench_cache_tx_a   = tx_a;
+    evtstream_state.bench_cache_tx_b   = tx_b;
+    evtstream_state.bench_cache_mock_fb = mock_fb;
+    evtstream_state.bench_cache_mock_fb_words = mock_fb_bytes / sizeof(uint32_t);
+    evtstream_state.bench_cache_pattern_counter = 0;
+
+    evtstream_reset_isr_counters();
+
+    evtstream_state.running = true;
+    evtstream_state.bench_cache_mode = true;
+    __DSB();
+    if (evtstream_arm_pit((uint32_t) window_us) < 0) {
+        evtstream_state.bench_cache_mode = false;
+        evtstream_state.running = false;
+        fb_free(); fb_free(); fb_free(); fb_free();
+        mp_raise_ValueError(MP_ERROR_TEXT("PIT period out of range"));
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(py_evtstream_bench_cache_obj, 0, py_evtstream_bench_cache);
+
 // evtstream.stop()
 //
 // Disables the PIT timer and its IRQ. Silent no-op if not running.
@@ -451,9 +591,9 @@ static mp_obj_t py_evtstream_stop(void) {
     // the NVIC line so any in-flight pending bit is cleared cleanly.
     evtstream_disarm_pit();
 
-    // Clear bench_mode before freeing the buffers it points at, so any
-    // late-arriving stale ISR (shouldn't happen — disarm above clears
-    // pending — but defensive) doesn't dereference freed memory.
+    // Clear bench_*_mode before freeing the buffers each points at, so
+    // any late-arriving stale ISR (shouldn't happen — disarm above
+    // clears pending — but defensive) doesn't dereference freed memory.
     if (evtstream_state.bench_mode) {
         evtstream_state.bench_mode = false;
         __DSB();
@@ -462,6 +602,19 @@ static mp_obj_t py_evtstream_stop(void) {
         // fb_alloc is LIFO — free in reverse-allocation order.
         fb_free();  // tx_b
         fb_free();  // tx_a
+    } else if (evtstream_state.bench_cache_mode) {
+        evtstream_state.bench_cache_mode = false;
+        __DSB();
+        evtstream_state.bench_cache_ring    = NULL;
+        evtstream_state.bench_cache_tx_a    = NULL;
+        evtstream_state.bench_cache_tx_b    = NULL;
+        evtstream_state.bench_cache_mock_fb = NULL;
+        // fb_alloc is LIFO — free in reverse-allocation order:
+        // mock_fb → tx_b → tx_a → ring.
+        fb_free();  // mock_fb
+        fb_free();  // tx_b
+        fb_free();  // tx_a
+        fb_free();  // ring
     }
 
     evtstream_state.running = false;
@@ -471,18 +624,20 @@ static MP_DEFINE_CONST_FUN_OBJ_0(py_evtstream_stop_obj, py_evtstream_stop);
 
 // evtstream.stats()
 //
-// Returns a snapshot of the counter dict. After step 3:
+// Returns a snapshot of the counter dict. After step 3a:
 //   - windows_sent, sequence, last_window_us — live in any mode (PIT-driven)
 //   - events_sent, usb_drops, last_window_event_count — live in bench mode
+//   - cache_mismatches — live in bench_cache mode
 //   - window_truncated_total, ring_lost_events_total, csi_dma_underruns —
 //     wired in steps 4-7
 static mp_obj_t py_evtstream_stats(void) {
-    mp_obj_t d = mp_obj_new_dict(9);
+    mp_obj_t d = mp_obj_new_dict(10);
     #define STORE(key, val) \
         mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_##key), mp_obj_new_int_from_uint(val))
     STORE(windows_sent,             evtstream_state.windows_sent);
     STORE(events_sent,              evtstream_state.events_sent);
     STORE(usb_drops,                evtstream_state.usb_drops);
+    STORE(cache_mismatches,         evtstream_state.cache_mismatches);
     STORE(window_truncated_total,   evtstream_state.window_truncated_total);
     STORE(ring_lost_events_total,   evtstream_state.ring_lost_events_total);
     STORE(csi_dma_underruns,        evtstream_state.csi_dma_underruns);
@@ -495,11 +650,12 @@ static mp_obj_t py_evtstream_stats(void) {
 static MP_DEFINE_CONST_FUN_OBJ_0(py_evtstream_stats_obj, py_evtstream_stats);
 
 static const mp_rom_map_elem_t evtstream_module_globals_table[] = {
-    { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_evtstream)        },
-    { MP_ROM_QSTR(MP_QSTR_start),    MP_ROM_PTR(&py_evtstream_start_obj)   },
-    { MP_ROM_QSTR(MP_QSTR_bench),    MP_ROM_PTR(&py_evtstream_bench_obj)   },
-    { MP_ROM_QSTR(MP_QSTR_stop),     MP_ROM_PTR(&py_evtstream_stop_obj)    },
-    { MP_ROM_QSTR(MP_QSTR_stats),    MP_ROM_PTR(&py_evtstream_stats_obj)   },
+    { MP_ROM_QSTR(MP_QSTR___name__),    MP_ROM_QSTR(MP_QSTR_evtstream)            },
+    { MP_ROM_QSTR(MP_QSTR_start),       MP_ROM_PTR(&py_evtstream_start_obj)       },
+    { MP_ROM_QSTR(MP_QSTR_bench),       MP_ROM_PTR(&py_evtstream_bench_obj)       },
+    { MP_ROM_QSTR(MP_QSTR_bench_cache), MP_ROM_PTR(&py_evtstream_bench_cache_obj) },
+    { MP_ROM_QSTR(MP_QSTR_stop),        MP_ROM_PTR(&py_evtstream_stop_obj)        },
+    { MP_ROM_QSTR(MP_QSTR_stats),       MP_ROM_PTR(&py_evtstream_stats_obj)       },
 };
 static MP_DEFINE_CONST_DICT(evtstream_module_globals, evtstream_module_globals_table);
 
