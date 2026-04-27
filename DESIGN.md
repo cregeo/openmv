@@ -252,18 +252,55 @@ at packet-completion time. The ring buffer (written in CSI ISR, read
 in PIT ISR, both on the hot path) is more sensitive and should stay
 in DTCM if possible.
 
+Production buffer geometry uses the §7a-recommended **h=6 lines**, so
+each FB is 6 KB (down from the 8 KB used by the validation patch).
+
 | Buffer | Old placement (§3) | New placement | Notes |
 |---|---|---|---|
 | Decoded event ring (32 KB) | DTCM | **DTCM** if free, else OCRM2 | Hot path, CSI-ISR-write / PIT-ISR-read; minimize cache traffic |
 | Packet TX buffer A (16404 B) | DTCM | **OCRM1 or DRAM** | USB EHCI DMA reads from any AXI-attached memory; cache-clean before submit |
 | Packet TX buffer B (16404 B) | DTCM | **OCRM1 or DRAM** | Same as A |
-| EVT2.0 raw FB1/FB2 (8 KB) | DTCM | **DRAM via fb_alloc** | Same approach as the validation patch (fb_alloc + cache-invalidate in IRQ); allows arbitrary `height_lines` without static budget |
+| EVT2.0 raw FB1 (h=6 → 6 KB) | DTCM | **DRAM via fb_alloc** | Same approach as the validation patch (fb_alloc + cache-invalidate in IRQ) |
+| EVT2.0 raw FB2 (h=6 → 6 KB) | DTCM | **DRAM via fb_alloc** | Same |
 | State struct (~128 B) | DTCM | **DTCM** | Tiny; touch-frequency justifies DTCM |
 
-DTCM additions for evtstream: ~32 KB (ring) + 128 B (state) ≈ 32 KB, vs.
-the original 73 KB. Achievable even with current DTCM pressure if we
-can free ~32 KB of headroom (or shave the GC heap by that much, which
-is also viable — 271 KB is generous).
+### DTCM budget — three cases (provisional pending readelf)
+
+The placement above is one specific point in a continuum of trade-offs.
+Three useful reference points for the readelf decision:
+
+| Case | Placement choice | DTCM addition |
+|---|---|---|
+| **Best (recommended)** | ring + state in DTCM; TX in OCRM1 or DRAM; FB in DRAM | ~32 KB |
+| **Mid** | ring + state + TX in DTCM; FB in DRAM | ~64 KB |
+| **Worst** | everything in DTCM (TX + FB included) | ~76 KB |
+
+Worst-case math: 32 KB ring + 16 KB TX-A + 16 KB TX-B + 6 KB FB1 + 6 KB
+FB2 + 0.128 KB state ≈ 76 KB. (My earlier "~32 KB" claim was best-case
+only and missed the TX bufs that the §3 budget had assumed sat in DTCM
+for latency reasons — the moved-to-OCRAM rationale needs to hold up
+under measurement before we lock in best-case.)
+
+**Worst-case 76 KB is meaningfully bigger than DTCM probably has free**
+right now — the validation patch overflowed by ~15 KB just adding
+16 KB of DTCM-static FB. The pre-existing OpenMV data fills DTCM to
+within ~10 KB of capacity.
+
+This is why the readelf measurement can't be deferred. Without it we
+don't know which of the three cases is actually achievable. Possible
+outcomes:
+
+- **≥ 32 KB free DTCM**: best case is on the table. Production design
+  uses ring+state in DTCM, TX in OCRM1, FB in DRAM. ~0.7% CPU overhead
+  for cache management on TX/FB stays.
+- **< 32 KB but ≥ ~10 KB free DTCM**: ring has to move to OCRM2
+  (64 KB region). Latency probe needed: ring CSI-ISR-write +
+  PIT-ISR-read pattern, in cached OCRM2, with DCache invalidation per
+  access. Likely fine but should be measured.
+- **< ~10 KB free DTCM**: shave the GC heap. `OMV_GC_BLOCK1_SIZE` is
+  271 KB; reducing by 32 KB to make room for the ring is a viable
+  path but visible to users (smaller MicroPython heap). Document the
+  trade-off in the eventual STATUS.md.
 
 ### Cache management for non-DTCM buffers
 
@@ -288,8 +325,9 @@ impact small), or (c) split the difference. Each option has different
 implications for the implementation. Surfacing this now — before any
 main-module code is written — keeps the budget revision scoped.
 
-If the readelf measurement comes back showing < 32 KB free DTCM, even
-the ring buffer has to move out and we re-evaluate latency.
+The "Three cases" table above operationalises the readelf branches.
+Each case has a concrete production-design implication; we pick the
+applicable case once we have the measurement in hand.
 
 ---
 

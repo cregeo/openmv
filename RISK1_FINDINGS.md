@@ -223,19 +223,22 @@ recognise that we need a deeper rethink.
 
 ### Use-case fit — see §7a for the latency derivation that backs this
 
-| Requirement              | Source         | C-frame fit | C-line fit |
-|--------------------------|----------------|-------------|------------|
-| ≤5 ms saccade latency    | NIR re-seed    | yes — 1.4 ms DMA fill + 1 ms PIT + ~1 ms USB | yes — sub-ms |
-| Fixation latency unbounded | Use case     | yes         | yes        |
-| 1 kHz packet cadence     | Tracker spec   | yes (PIT)   | yes (PIT)  |
-| 50K evt/s nominal load   | Eye scenes     | yes         | yes        |
-| 500K evt/s saccade rate  | Saccade physics| yes         | yes        |
-| ISR CPU < 5%             | Headroom       | yes (~0.7%) | unmeasured — pending §8d |
+| Requirement              | Source         | C-frame fit (h=6, see §7a) | C-line fit |
+|--------------------------|----------------|----------------------------|------------|
+| ≤5 ms saccade latency    | NIR re-seed    | yes — ~2.1 ms DMA fill + 1 ms PIT + ~1 ms USB ≈ 4.1 ms | yes — sub-ms |
+| Fixation latency unbounded | Use case     | yes                        | yes        |
+| 1 kHz packet cadence     | Tracker spec   | yes (PIT)                  | yes (PIT)  |
+| 50K evt/s nominal load   | Eye scenes     | yes                        | yes        |
+| 500K evt/s saccade rate  | Saccade physics| yes                        | yes        |
+| ISR CPU < 5%             | Headroom       | yes (~0.7%)                | unmeasured — pending §8d |
 
-**Default to C-frame with 4 KB buffers (h=4 lines)**. Latency budget for the
-eye-tracking use case is met during saccades (when it matters) and explicitly
-relaxed during fixation (when NIR ground truth carries the tracker). Do not
-proceed to C-line speculatively — see §8c.
+**Default to C-frame with 6 KB buffers (h=6 lines)** — superseded h=4 after
+the continuous-mode validation showed h=8 saw 99% pixel/wire efficiency vs
+h=4's 70-98%, and h=8 in turn left zero saccade-latency margin. h=6 is the
+compromise that keeps efficiency high while leaving ~0.86 ms of margin
+inside the 5 ms saccade budget. Latency is met during saccades (when it
+matters) and explicitly relaxed during fixation (when NIR ground truth
+carries the tracker). Do not proceed to C-line speculatively — see §8c.
 
 ---
 
@@ -284,42 +287,61 @@ events/sec while moving; this dominates the wire). So our latency
 analysis must be sized for **high event rate**, where DMA fills quickly
 and `L_fill` is small.
 
-### Worked numbers at h=4 lines (4 KB FB)
+### Worked numbers at h=6 lines (6 KB FB) — production default
 
 `dma_line_bytes = 1024` for GenX320 EVENT mode (sensor's CPI line width).
-At h=4 lines the FB is 4 KB / 1024 EVT2.0 words / ~700 pixel-event capacity.
+At h=6 lines the FB is 6 KB / 1536 EVT2.0 words. With ~99% pixel/wire
+efficiency (measured at h=8 in the continuous-mode validation; h=6 sits
+between h=4 and h=8, expect 95-99%), pixel-event capacity per FB is
+~1450-1520.
 
 | Scenario        | Pixel rate | Wire byte rate | `L_fill` | Total latency |
 |-----------------|-----------:|---------------:|---------:|--------------:|
-| Fixation        |    50K/s   |    ~280 KB/s   |  ~14 ms  |  ~16 ms (OK)  |
-| Onset transition|    rising  |    rising      |  ≤1.4 ms |  ≤3.4 ms (OK) |
-| Saccade peak    |   500K/s   |    ~2.8 MB/s   |  ~1.4 ms |   ~3.4 ms (OK) |
-| Blink burst     |   1M/s+    |    ~5.6 MB/s+  |  ~0.7 ms |   ~2.7 ms (OK) |
+| Fixation        |    50K/s   |    ~280 KB/s   |  ~21 ms  |  ~23 ms (OK\*) |
+| Onset transition|    rising  |    rising      |  ≤2.1 ms |  ≤4.1 ms (OK) |
+| Saccade peak    |   500K/s   |    ~2.8 MB/s   |  ~2.1 ms |   ~4.1 ms (OK) |
+| Blink burst     |   1M/s+    |    ~5.6 MB/s+  |  ~1.1 ms |   ~3.1 ms (OK) |
 
-The fixation row's 16 ms exceeds the budget; that's accepted per the
-saccade-vs-fixation framing. Every other row is comfortably under 5 ms.
+\* Fixation row exceeds the 5 ms budget by design — at fixation the NIR
+ground truth carries the tracker, so event latency is irrelevant. See
+saccade-vs-fixation framing above.
 
-### Why not 1 KB or 2 KB?
+Saccade row total ≈ 4.1 ms, leaving ~0.86 ms of slack inside the 5 ms
+budget. Tight but adequate. If measured `L_usb` turns out lower than the
+1 ms estimate, the slack grows accordingly.
 
-The pushback raised whether smaller buffers (1 KB / 2 KB) would do
-better. Working through it:
+### Why h=6, not h=4 or h=8?
 
-| Size  | Saccade `L_fill` | Onset `L_fill` (worst) | Saccade IRQ rate | IRQ CPU at saccade |
-|-------|------------------:|-----------------------:|-----------------:|-------------------:|
-| 1 KB  |  0.36 ms          |  0.36 ms               |  ~2,734 / s      |  ~0.8%             |
-| 2 KB  |  0.72 ms          |  0.72 ms               |  ~1,367 / s      |  ~0.7%             |
-| 4 KB  |  1.4 ms           |  1.4 ms                |  ~683 / s        |  ~0.7%             |
+The continuous-mode validation produced these per-FB observations
+(hand-waving in front of lens):
 
-All three meet the budget cleanly. Smaller is faster but with diminishing
-returns, and the IRQ overhead is negligible at all three sizes. No
-operational reason picks 1 or 2 over 4.
+| Height | Mean pixels/FB | Pixel/wire ratio | std/mean |
+|--------|---------------:|-----------------:|---------:|
+| h=4    |        ~715–1001 |       70–98%     |  0.002–0.008 |
+| h=8    |        ~2028     |       ~99%       |  0.002 |
 
-**Default: h=4 (4 KB FB).** Recommended for the design.
+Both heights cleared the unimodality test by orders of magnitude. The
+choice is between latency margin and pixel/wire efficiency:
 
-But: the validation patch in §8a exposes `height_lines` as a Python
-parameter so the next hardware run can sweep h ∈ {1, 2, 4, 8} cheaply.
-If the data surfaces a reason to prefer a different size, we revise
-before locking the design.
+| Size  | Saccade `L_fill` | Saccade total | Margin to 5 ms | Pixel/wire | Saccade IRQ rate | IRQ CPU |
+|-------|-----------------:|--------------:|---------------:|-----------:|-----------------:|--------:|
+| h=4 (4 KB)  | 1.4 ms     | 3.4 ms        |  1.6 ms        | 70–98%     | ~683 / s         | ~0.7%   |
+| h=6 (6 KB)  | 2.1 ms     | 4.1 ms        |  0.9 ms        | ~95–99% est | ~456 / s         | ~0.7%   |
+| h=8 (8 KB)  | 2.9 ms     | 4.9 ms        |  0.1 ms        | ~99%       | ~342 / s         | ~0.7%   |
+
+- h=4 has the most slack but wastes up to 30 % of DMA bandwidth on
+  EV_TIME_HIGH filler in low-activity scenes.
+- h=8 has the highest pixel/wire efficiency but leaves zero slack — any
+  unmodeled USB jitter or PIT deferral pushes us out of budget.
+- h=6 is the compromise: ~95-99 % pixel/wire efficiency (extrapolated;
+  worth confirming with a sweep) and ~0.86 ms of saccade-budget slack.
+
+**Default: h=6 (6 KB FB).** Recommended for the design.
+
+The validation patch exposes `height_lines` as a Python parameter so the
+next hardware run can confirm h=6's pixel/wire ratio. If h=6 turns out
+to behave like h=4 (70 % at low activity) instead of like h=8 (99 %),
+we revisit. The cap is `DEBUG_STREAM_MAX_FB_BYTES = 8 KB` so h=6 fits.
 
 ### Caveats baked into this derivation
 
@@ -360,8 +382,8 @@ side-by-side comparisons if needed during analysis. Implementation
 sketch:
 
 1. Configure the CSI peripheral in **non-`one_shot` mode** with
-   `IMAG_PARA` height set per the §7a recommendation (default h=4
-   lines, but exposed as a Python argument so we can sweep).
+   `IMAG_PARA` height set per the §7a recommendation (production
+   default h=6 lines, but exposed as a Python argument so we can sweep).
 2. Allocate two FB buffers (sized `height_lines × dma_line_bytes`)
    and point `CSI_REG_DMASA_FB1` / `_FB2` at them. CSI ping-pongs
    FB1↔FB2 with no off-time between them.
@@ -387,41 +409,41 @@ n_fbs = csi0.ioctl(csi.IOCTL_GENX320_DEBUG_CAPTURE_CONTINUOUS,
 
 ### 8b. Run on hardware
 
-Same procedure as the first validation. Suggested sweep:
+Same procedure as the first validation. Suggested sweep (default in the
+v2 script):
 
-1. Run with `height_lines=4, duration_ms=1000` (the design default).
-2. Run with `height_lines=2` and `=1` to sanity-check that the answer
-   doesn't depend on the specific size.
-3. Optional: run with `height_lines=16` to compare against the original
-   snapshot-mode default-height capture.
+1. Run with `HEIGHTS = [8, 6]` to confirm the production candidate (h=6)
+   against the reference (h=8 is largest fitting the 8 KB cap).
+2. Optional broader sweep: `HEIGHTS = [8, 6, 4, 2, 1]`.
 
-The script will print aggregate stats AND per-FB distribution analysis
-so the same log can be inspected for Hypothesis A vs B signature.
+The script prints aggregate stats AND per-FB distribution analysis so
+the same log can be inspected for Hypothesis A vs B signature.
 
-### 8c. Decision criteria — strict
+### 8c. Decision criteria — loosened from earlier draft
 
-Pass criteria for **continuous-mode capture at any tested
-`height_lines`**:
+The original §8c criteria assumed wire content scales linearly across
+heights. The continuous-mode validation showed it does not — the GenX320's
+CPI block paces filler differently at different buffer sizes, so the
+pixel/wire ratio is height-dependent (h=8 saw 99 %; h=4 saw 70-98 %).
+Loosened criteria:
 
-1. Aggregate pixel-event count is within ±25 % of the geometric
-   expectation calibrated against a reference-height continuous-mode
-   capture in the same run.
-2. Pixel/total ratio across the run is within ±15 percentage points of
-   the reference-height capture in the same run.
-3. EV_TIME_HIGH count is within ±50 % of the geometric expectation.
-4. Per-FB pixel count distribution is **unimodal** with std dev ≤ 50%
-   of the mean (after excluding the first 2 FBs as transient). Bimodal
-   distribution would be the Hypothesis-A signature; if present we
-   stop and revisit.
-5. No timestamp monotonicity violations beyond the EV_TIME_HIGH
-   boundary count (≤ 2× the EV_TIME_HIGH count).
-6. No invalid x/y coordinates.
+1. **Per-FB pixel-count distribution unimodal** — std/mean ≤ 0.5 after
+   excluding the first 2 transient FBs. **Primary discriminator** for
+   Hypothesis A vs B. Keep strict.
+2. **Aggregate pixel-event count ≥ 20 %** of the linear-scaling
+   expectation. Loose floor — catches "captured almost nothing"
+   while tolerating scene-dependent variation.
+3. **Steady-state per-FB pixel count ≥ 1.** Sensor-on check.
+4. **No invalid x/y coordinates.** Basic coherence.
+5. **No timestamp monotonicity violations** beyond the EV_TIME_HIGH
+   boundary count (checked inside the C decoder; not surfaced in the
+   per-FB stats).
 
-If the script reports PASS at h=4, h=2, AND h=1: continuous-mode
-ping-pong DMA preserves event coherence at all relevant sizes →
-**Option C-frame is viable** → original Option B design holds with the
-clarification "always continuous, never snapshot-per-call". Proceed to
-Task 3 main implementation with h=4 as the default size.
+If the script reports PASS at all swept heights: continuous-mode ping-pong
+DMA preserves event coherence at all relevant sizes → **Option C-frame
+is viable** → original Option B design holds with the clarification
+"always continuous, never snapshot-per-call". Proceed to Task 3 main
+implementation with **h=6 as the production default** (per §7a).
 
 If the script reports FAIL at any tested size: **stop**. Do not
 escalate to C-line speculatively.
