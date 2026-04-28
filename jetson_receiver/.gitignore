@@ -1,0 +1,11 @@
+# Local Python virtualenv (operators create one per the README install
+# instructions). Never tracked.
+.venv/
+
+# Capture artifacts from `--save`. Filenames vary; default is
+# evtstream_capture.npz, but the README example uses session names too.
+*.npz
+
+# Python bytecode caches.
+__pycache__/
+*.py[cod]
