@@ -6,8 +6,13 @@ greps the [CADENCE] markers it prints, and asserts:
 
   1. MCU window inter-arrival std <= 50 us  (the original cadence
      target from the task brief and DESIGN.md / RISK1_FINDINGS §7a).
+     Computed across consecutive-sequence pairs only, after the
+     receiver drains pre-test stale CDC FIFO bytes.
   2. resync_count == 0 over the test (no magic-byte slips ->
      wire-level integrity is intact).
+  3. Post-drain packet count in [1000 - tol, 1000 + tol] /sec band
+     (default tol = 50/sec). Two-sided check catches both
+     catastrophic packet loss and unexpected packet surges.
 
 PASS exits 0, FAIL exits 1. Captured numbers are printed regardless
 so a failed run is debuggable from the log.
@@ -63,6 +68,13 @@ def main():
                    help="MCU window inter-arrival std threshold (default 50)")
     p.add_argument("--max-resyncs", type=int, default=0,
                    help="maximum allowed resync events (default 0)")
+    p.add_argument("--drain-seconds", type=float, default=1.0,
+                   help="receiver startup discard window (default 1.0). "
+                        "Forwarded to evtstream_receiver.py and used here "
+                        "to compute the expected post-drain packet count.")
+    p.add_argument("--rate-tolerance-per-sec", type=float, default=50.0,
+                   help="acceptable deviation from the nominal 1000 "
+                        "packets/sec rate (default +/- 50/sec)")
     p.add_argument("--receiver", default="evtstream_receiver.py",
                    help="path to receiver script (default ./evtstream_receiver.py)")
     args = p.parse_args()
@@ -74,6 +86,7 @@ def main():
         "--device", args.device,
         "--duration", str(args.duration),
         "--summary-interval", str(max(args.duration, 1.0)),  # one final summary is enough
+        "--drain-seconds", str(args.drain_seconds),
     ]
     print("[test_cadence] running:", " ".join(cmd))
 
@@ -92,17 +105,34 @@ def main():
     mcu_mean = markers.get("mcu_interval_mean_us")
     resync = markers.get("resync_count")
     packets = markers.get("packets")
+    drained = markers.get("drained_packets")
+    consec = markers.get("consecutive_intervals")
+    drain_sec = markers.get("drain_seconds", args.drain_seconds)
+
+    # Effective measurement window after subtracting the drain.
+    measured_seconds = max(args.duration - drain_sec, 0.0)
+    expected_packets = measured_seconds * 1000.0  # nominal 1 kHz
+    rate_band = args.rate_tolerance_per_sec * measured_seconds
+    min_packets = expected_packets - rate_band
+    max_packets = expected_packets + rate_band
 
     print("[test_cadence] measured:")
-    print("  packets             :", packets)
+    print("  drain_seconds       :", drain_sec)
+    print("  drained_packets     :", drained)
+    print("  packets (post-drain):", packets)
+    print("  consecutive_intervals:", consec)
     print("  mcu_interval_mean_us:", mcu_mean)
     print("  mcu_interval_std_us :", mcu_std)
     print("  resync_count        :", resync)
+    print("  expected packets    : %.0f in [%.0f, %.0f] (1000/sec +/- %.0f/sec "
+          "over %.1fs measurement window)"
+          % (expected_packets, min_packets, max_packets,
+             args.rate_tolerance_per_sec, measured_seconds))
 
     fails = []
     if mcu_std is None:
         fails.append("no mcu_interval_std_us marker captured "
-                     "(receiver produced no packets?)")
+                     "(receiver produced no consecutive intervals?)")
     elif mcu_std > args.max_mcu_std_us:
         fails.append("mcu_interval_std_us %.2f > threshold %.2f"
                      % (mcu_std, args.max_mcu_std_us))
@@ -113,12 +143,17 @@ def main():
         fails.append("resync_count %d > threshold %d"
                      % (int(resync), args.max_resyncs))
 
-    if packets is None or packets < 0.9 * args.duration * 1000:
-        # Sanity: at 1 kHz cadence we should see ~duration*1000 packets.
-        # 90% floor catches catastrophic packet loss before threshold
-        # checks declare PASS on near-zero data.
-        fails.append("packet count %s well below expected ~%d"
-                     % (packets, int(args.duration * 1000)))
+    if packets is None:
+        fails.append("no packets marker captured")
+    elif packets < min_packets or packets > max_packets:
+        # Two-sided rate band (+/- rate-tolerance-per-sec / sec). Catches
+        # both catastrophic packet loss (rate too low) and unexpected
+        # surges (rate too high, which would imply duplicate packets or
+        # a misconfigured PIT period).
+        fails.append("packet count %d outside [%.0f, %.0f] "
+                     "(post-drain rate not 1 kHz +/- %.0f/sec)"
+                     % (int(packets), min_packets, max_packets,
+                        args.rate_tolerance_per_sec))
 
     if fails:
         print()
@@ -135,7 +170,10 @@ def main():
     print("=" * 64)
     print(" mcu_interval_std_us=%.2f (<= %.2f)" % (mcu_std, args.max_mcu_std_us))
     print(" resync_count=%d (<= %d)" % (int(resync), args.max_resyncs))
-    print(" packets=%d" % int(packets))
+    print(" packets=%d in [%d, %d]"
+          % (int(packets), int(min_packets), int(max_packets)))
+    if consec is not None:
+        print(" consecutive_intervals=%d" % int(consec))
     sys.exit(0)
 
 

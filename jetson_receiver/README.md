@@ -89,6 +89,18 @@ resync events, and sequence gaps. Doesn't save events.
 python3 evtstream_receiver.py --measure-cadence --duration 10
 ```
 
+The first `--drain-seconds` (default 1.0 s) of received data is
+discarded before stats start. This flushes the OS USB stack and the
+OpenMV CDC TX FIFO of bytes buffered before the test started --
+those carry `window_start_us` values from a much earlier wall-clock
+moment and would otherwise poison the inter-arrival distribution.
+
+Inter-arrival samples are only taken across packets whose sequence
+numbers are consecutive (`(last_seq + 1) mod 2^32`). Any gap counts
+into `sequence_gaps` and the corresponding interval is skipped via
+`skipped_intervals` rather than turning the cross-gap delta into a
+nonsense sample.
+
 Output ends with a `[CADENCE]` block of `key=value` markers that
 are easy to grep. Example:
 
